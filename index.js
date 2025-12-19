@@ -26,11 +26,10 @@ const REQUEST_TIMEOUT_MS = 20_000;
 const STATE_FILE = path.join(__dirname, "state.json");
 const DEFAULT_SOURCE = "";
 
+// txt attachment limits
+const MAX_TXT_BYTES = 1_000_000; // 1MB đủ dùng; file quá lớn thì từ chối
+
 // ================== STATE (PER-CHANNEL) ==================
-/**
- * Key format: `${guildId}:${channelId}`
- * state = { sources: {}, mins: {}, times: {} }
- */
 let state = { sources: {}, mins: {}, times: {} };
 
 function loadState() {
@@ -168,7 +167,6 @@ function extractSystemTransfers(tx) {
       out.push({ from: info.source, to: info.destination, lamports: Number(info.lamports || 0) });
     }
   }
-
   for (const group of tx?.meta?.innerInstructions || []) {
     for (const ix of group?.instructions || []) {
       if (ix?.program === "system" && ix?.parsed?.type === "transfer") {
@@ -189,6 +187,36 @@ function parseWallets(raw) {
     .filter(Boolean)
     .map((s) => s.replace(/^"+|"+$/g, ""))
     .filter(Boolean);
+}
+
+// ================== ATTACHMENT TXT SUPPORT ==================
+function pickTxtAttachment(msg) {
+  // ưu tiên file message.txt / *.txt
+  const atts = [...msg.attachments.values()];
+  if (atts.length === 0) return null;
+
+  // pick first .txt (hoặc message.txt) theo thứ tự ưu tiên
+  const byName = (a) => (a.name || "").toLowerCase();
+  const isTxt = (a) => byName(a).endsWith(".txt") || byName(a) === "message.txt";
+  const txt = atts.find(isTxt);
+  if (txt) return txt;
+
+  // fallback: nếu Discord gửi file không .txt nhưng content-type text/plain
+  const plain = atts.find((a) => (a.contentType || "").includes("text/plain"));
+  return plain || null;
+}
+
+async function downloadAttachmentText(att) {
+  // limit size
+  const size = Number(att.size || 0);
+  if (size > MAX_TXT_BYTES) {
+    throw new Error(`File quá lớn (${Math.round(size / 1024)}KB). Max ~${Math.round(MAX_TXT_BYTES / 1024)}KB.`);
+  }
+
+  const url = att.url;
+  const res = await axios.get(url, { responseType: "text", timeout: REQUEST_TIMEOUT_MS });
+  if (typeof res.data !== "string") throw new Error("Không đọc được nội dung file text.");
+  return res.data;
 }
 
 // ================== CONCURRENCY ==================
@@ -229,7 +257,7 @@ async function scanWalletWithSource(wallet, sourceWallet, minSol, timeHours) {
     })
   );
 
-  // ✅ Time window check (CẢ 2 tx cũ nhất phải trong timeHours)
+  // Time window: cả 2 tx cũ nhất phải trong X giờ
   const nowSec = Math.floor(Date.now() / 1000);
   const maxAgeSec = Math.floor(timeHours * 3600);
   for (const t of txs) {
@@ -237,17 +265,12 @@ async function scanWalletWithSource(wallet, sourceWallet, minSol, timeHours) {
     if (nowSec - t.blockTime > maxAgeSec) return null;
   }
 
-  // ✅ White-ish check
+  // White-ish
   const isCond1 = sigs.length === 1 && txs[0]?.isTransferTx === true;
-  const isCond2 =
-    sigs.length >= 2 &&
-    txs.length >= 2 &&
-    txs[0].isTransferTx &&
-    txs[1].isTransferTx;
-
+  const isCond2 = sigs.length >= 2 && txs.length >= 2 && txs[0].isTransferTx && txs[1].isTransferTx;
   if (!isCond1 && !isCond2) return null;
 
-  // ✅ Funding condition in oldest 2 tx
+  // Funding from source -> wallet >= minSol (trong 2 tx cũ nhất)
   for (const t of txs) {
     for (const tr of t.transfers) {
       if (tr.from !== sourceWallet) continue;
@@ -389,7 +412,7 @@ client.on("interactionCreate", async (interaction) => {
     const channelId = interaction.channelId;
     if (!guildId || !channelId) return;
 
-    // /show (per-channel)
+    // /show
     if (interaction.commandName === "show") {
       await interaction.deferReply();
 
@@ -405,17 +428,14 @@ client.on("interactionCreate", async (interaction) => {
           `**Source:** ${source ? `[${source}](${solscanTransfersUrl(source)})` : "*chưa set*"}\n` +
           `**Min SOL:** **${minSol}**\n` +
           `**Time window:** **${timeHours} giờ**\n\n` +
-          `Dùng:\n` +
-          `- \`/source "wallet"\`\n` +
-          `- \`/min sol:50\`\n` +
-          `- \`/time hours:5\``
+          `Dùng:\n- \`/source "wallet"\`\n- \`/min sol:50\`\n- \`/time hours:5\``
         )
         .setTimestamp(new Date());
 
       return interaction.editReply({ embeds: [e] });
     }
 
-    // /source (per-channel)
+    // /source
     if (interaction.commandName === "source") {
       await interaction.deferReply();
 
@@ -431,15 +451,14 @@ client.on("interactionCreate", async (interaction) => {
         .setTitle("✅ Source Updated (This Channel)")
         .setColor(0x3498db)
         .setDescription(
-          `**Channel:** <#${channelId}>\n` +
-          `Source:\n**${source}**\n\nLink: ${solscanTransfersUrl(source)}`
+          `**Channel:** <#${channelId}>\nSource:\n**${source}**\n\nLink: ${solscanTransfersUrl(source)}`
         )
         .setTimestamp(new Date());
 
       return interaction.editReply({ embeds: [e] });
     }
 
-    // /min (per-channel)
+    // /min
     if (interaction.commandName === "min") {
       await interaction.deferReply();
 
@@ -457,7 +476,7 @@ client.on("interactionCreate", async (interaction) => {
       return interaction.editReply({ embeds: [e] });
     }
 
-    // /time (per-channel)
+    // /time
     if (interaction.commandName === "time") {
       await interaction.deferReply();
 
@@ -511,15 +530,17 @@ client.on("interactionCreate", async (interaction) => {
       waiting.set(key, { expiresAt: Date.now() + 60_000, source, minSol, timeHours, channelId });
 
       const e = new EmbedBuilder()
-        .setTitle("📝 Paste Wallet List")
+        .setTitle("📝 Paste list hoặc upload .txt")
         .setColor(0xf1c40f)
         .setDescription(
           `**Channel:** <#${channelId}>\n` +
-          `Paste list ví (mỗi dòng 1 ví) trong **60 giây**.\n\n` +
+          `Trong **60 giây**, bạn có thể:\n` +
+          `1) Paste list ví nhiều dòng, hoặc\n` +
+          `2) Upload file **message.txt / .txt** (Discord auto tạo cũng được)\n\n` +
           `**Source:** ${shortPk(source)}\n` +
           `**Min:** ${minSol} SOL\n` +
           `**Time window:** ${timeHours} giờ\n\n` +
-          `Ví dụ:\n\`"wallet1"\n"wallet2"\n"wallet3"\``
+          `Ví dụ paste:\n\`"wallet1"\n"wallet2"\n"wallet3"\``
         )
         .setTimestamp(new Date());
 
@@ -547,12 +568,28 @@ client.on("messageCreate", async (msg) => {
       return;
     }
 
+    // consume
     waiting.delete(key);
 
-    const wallets = [...new Set(parseWallets(msg.content))].slice(0, 250);
-    if (wallets.length === 0) return msg.reply("❌ Không thấy ví nào trong message bạn vừa paste.");
+    // 1) Prefer attachment .txt if exists
+    let rawText = msg.content || "";
+    const att = pickTxtAttachment(msg);
 
-    await msg.reply(`⏳ Đang scan **${wallets.length}** ví...`);
+    if (att) {
+      try {
+        rawText = await downloadAttachmentText(att);
+      } catch (e) {
+        return msg.reply(`❌ Không đọc được file .txt: ${e.message}`);
+      }
+    }
+
+    const wallets = [...new Set(parseWallets(rawText))].slice(0, 250);
+    if (wallets.length === 0) {
+      return msg.reply("❌ Không thấy ví nào (paste sai format hoặc file rỗng).");
+    }
+
+    const srcHint = att ? `📎 Đã đọc từ file: **${att.name}**` : "📝 Đã đọc từ message";
+    await msg.reply(`${srcHint}\n⏳ Đang scan **${wallets.length}** ví...`);
 
     return runScanAndRespond(msg, wallets, w.source, w.minSol, w.timeHours, w.channelId);
   } catch {}
@@ -576,6 +613,7 @@ client.on("messageCreate", async (msg) => {
     console.log(`💰 Default Min: ${DEFAULT_MIN_SOL} SOL`);
     console.log(`⏱ Default Time: ${DEFAULT_TIME_HOURS} hours`);
     console.log(`🧩 Config scope: PER CHANNEL`);
+    console.log(`📎 scanlist: supports .txt attachment`);
   });
 
   await client.login(process.env.DISCORD_BOT_TOKEN);
