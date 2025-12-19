@@ -4,7 +4,7 @@ const { REST, Routes, SlashCommandBuilder } = require("discord.js");
 const commands = [
   new SlashCommandBuilder()
     .setName("source")
-    .setDescription("Set source wallet (ví gửi SOL) cho server này")
+    .setDescription("Set source wallet (ví gửi SOL) cho channel này")
     .addStringOption((opt) =>
       opt
         .setName("wallet")
@@ -14,7 +14,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("min")
-    .setDescription("Set min SOL (ngưỡng tối thiểu) cho server này")
+    .setDescription("Set min SOL (ngưỡng tối thiểu) cho channel này")
     .addNumberOption((opt) =>
       opt
         .setName("sol")
@@ -25,7 +25,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("time")
-    .setDescription("Set thời gian tối đa (giờ) cho 2 tx cũ nhất")
+    .setDescription("Set thời gian tối đa (giờ) cho 2 tx cũ nhất (channel này)")
     .addNumberOption((opt) =>
       opt
         .setName("hours")
@@ -37,11 +37,11 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("show")
-    .setDescription("Xem cấu hình hiện tại (source/min/time) của server"),
+    .setDescription("Xem cấu hình hiện tại (source/min/time) của channel này"),
 
   new SlashCommandBuilder()
     .setName("scan")
-    .setDescription("Scan 1 Solana wallet theo điều kiện")
+    .setDescription("Scan 1 Solana wallet theo điều kiện (channel config)")
     .addStringOption((opt) =>
       opt
         .setName("wallet")
