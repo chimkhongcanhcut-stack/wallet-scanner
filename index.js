@@ -13,6 +13,14 @@ const {
   ButtonStyle,
 } = require("discord.js");
 
+// ================== HARD LOG (để bắt lỗi defer/reply) ==================
+process.on("unhandledRejection", (err) => {
+  console.error("❌ unhandledRejection:", err);
+});
+process.on("uncaughtException", (err) => {
+  console.error("❌ uncaughtException:", err);
+});
+
 // ================== CONFIG ==================
 const RPC_URL = process.env.RPC_URL;
 
@@ -36,8 +44,7 @@ function loadState() {
   try {
     if (fs.existsSync(STATE_FILE)) {
       state = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-      if (!state || typeof state !== "object")
-        state = { sources: {}, mins: {}, times: {} };
+      if (!state || typeof state !== "object") state = { sources: {}, mins: {}, times: {} };
       if (!state.sources || typeof state.sources !== "object") state.sources = {};
       if (!state.mins || typeof state.mins !== "object") state.mins = {};
       if (!state.times || typeof state.times !== "object") state.times = {};
@@ -106,9 +113,7 @@ function scanNowStr() {
 }
 function formatTime(blockTime) {
   if (!blockTime) return "N/A";
-  return new Date(blockTime * 1000).toLocaleString("vi-VN", {
-    timeZone: "Asia/Bangkok",
-  });
+  return new Date(blockTime * 1000).toLocaleString("vi-VN", { timeZone: "Asia/Bangkok" });
 }
 function solscanTransfersUrl(wallet) {
   return `https://solscan.io/account/${wallet}?page_size=100#transfers`;
@@ -121,22 +126,51 @@ function shortPk(pk) {
   return `${pk.slice(0, 4)}…${pk.slice(-4)}`;
 }
 
-// ================== INTERACTION ACK HELPERS (FIX LAG / This interaction failed) ==================
+// ================== INTERACTION ACK HELPERS (FIX) ==================
 async function safeDefer(interaction) {
-  // ACK trong 3s, tránh double-ACK
-  if (!interaction || interaction.deferred || interaction.replied) return;
+  if (!interaction || interaction.deferred || interaction.replied) return true;
   try {
+    // ACK trong 3 giây — không làm gì trước dòng này
     await interaction.deferReply({ ephemeral: false });
-  } catch {}
+    return true;
+  } catch (e) {
+    console.error("❌ deferReply failed:", {
+      code: e?.code,
+      message: e?.message,
+      name: e?.name,
+    });
+
+    // fallback: thử reply ephemeral để báo thiếu quyền (nếu được)
+    try {
+      await interaction.reply({
+        content:
+          "❌ Bot không ACK được (thường do thiếu quyền trong channel). Cấp: View Channel + Send Messages + Embed Links + Use Application Commands.",
+        ephemeral: true,
+      });
+      return true;
+    } catch (e2) {
+      console.error("❌ reply fallback failed:", {
+        code: e2?.code,
+        message: e2?.message,
+        name: e2?.name,
+      });
+      return false;
+    }
+  }
 }
 
 async function safeEdit(interaction, payload) {
-  // editReply an toàn (khi đã defer/reply)
   try {
-    if (interaction && (interaction.deferred || interaction.replied)) {
+    if (interaction.deferred || interaction.replied) {
       return await interaction.editReply(payload);
     }
-  } catch {}
+  } catch (e) {
+    console.error("❌ editReply failed:", {
+      code: e?.code,
+      message: e?.message,
+      name: e?.name,
+    });
+  }
 }
 
 // ================== RPC HELPERS ==================
@@ -185,22 +219,14 @@ function extractSystemTransfers(tx) {
   for (const ix of tx?.transaction?.message?.instructions || []) {
     if (ix?.program === "system" && ix?.parsed?.type === "transfer") {
       const info = ix.parsed.info;
-      out.push({
-        from: info.source,
-        to: info.destination,
-        lamports: Number(info.lamports || 0),
-      });
+      out.push({ from: info.source, to: info.destination, lamports: Number(info.lamports || 0) });
     }
   }
   for (const group of tx?.meta?.innerInstructions || []) {
     for (const ix of group?.instructions || []) {
       if (ix?.program === "system" && ix?.parsed?.type === "transfer") {
         const info = ix.parsed.info;
-        out.push({
-          from: info.source,
-          to: info.destination,
-          lamports: Number(info.lamports || 0),
-        });
+        out.push({ from: info.source, to: info.destination, lamports: Number(info.lamports || 0) });
       }
     }
   }
@@ -220,39 +246,29 @@ function parseWallets(raw) {
 
 // ================== ATTACHMENT TXT SUPPORT ==================
 function pickTxtAttachment(msg) {
-  // ưu tiên file message.txt / *.txt
   const atts = [...msg.attachments.values()];
   if (atts.length === 0) return null;
 
-  // pick first .txt (hoặc message.txt) theo thứ tự ưu tiên
   const byName = (a) => (a.name || "").toLowerCase();
   const isTxt = (a) => byName(a).endsWith(".txt") || byName(a) === "message.txt";
   const txt = atts.find(isTxt);
   if (txt) return txt;
 
-  // fallback: nếu Discord gửi file không .txt nhưng content-type text/plain
   const plain = atts.find((a) => (a.contentType || "").includes("text/plain"));
   return plain || null;
 }
 
 async function downloadAttachmentText(att) {
-  // limit size
   const size = Number(att.size || 0);
   if (size > MAX_TXT_BYTES) {
     throw new Error(
-      `File quá lớn (${Math.round(size / 1024)}KB). Max ~${Math.round(
-        MAX_TXT_BYTES / 1024
-      )}KB.`
+      `File quá lớn (${Math.round(size / 1024)}KB). Max ~${Math.round(MAX_TXT_BYTES / 1024)}KB.`
     );
   }
 
   const url = att.url;
-  const res = await axios.get(url, {
-    responseType: "text",
-    timeout: REQUEST_TIMEOUT_MS,
-  });
-  if (typeof res.data !== "string")
-    throw new Error("Không đọc được nội dung file text.");
+  const res = await axios.get(url, { responseType: "text", timeout: REQUEST_TIMEOUT_MS });
+  if (typeof res.data !== "string") throw new Error("Không đọc được nội dung file text.");
   return res.data;
 }
 
@@ -304,11 +320,7 @@ async function scanWalletWithSource(wallet, sourceWallet, minSol, timeHours) {
 
   // White-ish
   const isCond1 = sigs.length === 1 && txs[0]?.isTransferTx === true;
-  const isCond2 =
-    sigs.length >= 2 &&
-    txs.length >= 2 &&
-    txs[0].isTransferTx &&
-    txs[1].isTransferTx;
+  const isCond2 = sigs.length >= 2 && txs.length >= 2 && txs[0].isTransferTx && txs[1].isTransferTx;
   if (!isCond1 && !isCond2) return null;
 
   // Funding from source -> wallet >= minSol (trong 2 tx cũ nhất)
@@ -382,14 +394,8 @@ function makeWalletEmbed(hit) {
 
 function makeWalletButtons(hit) {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setLabel("Open Transfers")
-      .setStyle(ButtonStyle.Link)
-      .setURL(solscanTransfersUrl(hit.wallet)),
-    new ButtonBuilder()
-      .setLabel("Open TX")
-      .setStyle(ButtonStyle.Link)
-      .setURL(solscanTxUrl(hit.sig))
+    new ButtonBuilder().setLabel("Open Transfers").setStyle(ButtonStyle.Link).setURL(solscanTransfersUrl(hit.wallet)),
+    new ButtonBuilder().setLabel("Open TX").setStyle(ButtonStyle.Link).setURL(solscanTxUrl(hit.sig))
   );
 }
 
@@ -444,156 +450,158 @@ function waitKey(guildId, userId, channelId) {
   return `${guildId}:${userId}:${channelId}`;
 }
 
-// ================== INTERACTIONS (FIXED) ==================
+// ================== INTERACTIONS ==================
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
-  // ACK NGAY: tránh "This interaction failed"
-  await safeDefer(interaction);
+  // ACK NGAY — nếu fail thì dừng (đỡ "did not respond")
+  const ackOk = await safeDefer(interaction);
+  if (!ackOk) return;
 
-  const guildId = interaction.guildId;
-  const channelId = interaction.channelId;
-  if (!guildId || !channelId) {
-    return safeEdit(interaction, { content: "❌ Missing guild/channel context." });
-  }
-
-  try {
-    // /show
-    if (interaction.commandName === "show") {
-      const source = getSourceForChannel(guildId, channelId);
-      const minSol = getMinForChannel(guildId, channelId);
-      const timeHours = getTimeForChannel(guildId, channelId);
-
-      const e = new EmbedBuilder()
-        .setTitle("⚙️ Current Config (This Channel)")
-        .setColor(0x3498db)
-        .setDescription(
-          `**Channel:** <#${channelId}>\n` +
-            `**Source:** ${source ? `[${source}](${solscanTransfersUrl(source)})` : "*chưa set*"}\n` +
-            `**Min SOL:** **${minSol}**\n` +
-            `**Time window:** **${timeHours} giờ**\n\n` +
-            `Dùng:\n- \`/source "wallet"\`\n- \`/min sol:50\`\n- \`/time hours:5\``
-        )
-        .setTimestamp(new Date());
-
-      return safeEdit(interaction, { embeds: [e] });
-    }
-
-    // /source
-    if (interaction.commandName === "source") {
-      const raw = interaction.options.getString("wallet") || "";
-      const source = raw.trim().replace(/^"+|"+$/g, "");
-
-      if (!looksLikeSolPubkey(source)) {
-        return safeEdit(interaction, { content: "❌ Source wallet không hợp lệ (pubkey Solana)." });
+  // Đẩy xử lý nặng sang tick sau để chắc chắn ACK đã đi
+  setImmediate(async () => {
+    try {
+      const guildId = interaction.guildId;
+      const channelId = interaction.channelId;
+      if (!guildId || !channelId) {
+        return safeEdit(interaction, { content: "❌ Missing guild/channel context." });
       }
 
-      setSourceForChannel(guildId, channelId, source);
+      // /show
+      if (interaction.commandName === "show") {
+        const source = getSourceForChannel(guildId, channelId);
+        const minSol = getMinForChannel(guildId, channelId);
+        const timeHours = getTimeForChannel(guildId, channelId);
 
-      const e = new EmbedBuilder()
-        .setTitle("✅ Source Updated (This Channel)")
-        .setColor(0x3498db)
-        .setDescription(
-          `**Channel:** <#${channelId}>\nSource:\n**${source}**\n\nLink: ${solscanTransfersUrl(source)}`
-        )
-        .setTimestamp(new Date());
+        const e = new EmbedBuilder()
+          .setTitle("⚙️ Current Config (This Channel)")
+          .setColor(0x3498db)
+          .setDescription(
+            `**Channel:** <#${channelId}>\n` +
+              `**Source:** ${source ? `[${source}](${solscanTransfersUrl(source)})` : "*chưa set*"}\n` +
+              `**Min SOL:** **${minSol}**\n` +
+              `**Time window:** **${timeHours} giờ**\n\n` +
+              `Dùng:\n- \`/source "wallet"\`\n- \`/min sol:50\`\n- \`/time hours:5\``
+          )
+          .setTimestamp(new Date());
 
-      return safeEdit(interaction, { embeds: [e] });
-    }
-
-    // /min
-    if (interaction.commandName === "min") {
-      const v = Number(interaction.options.getNumber("sol"));
-      if (!Number.isFinite(v) || v < 0) {
-        return safeEdit(interaction, { content: "❌ Min SOL không hợp lệ." });
+        return safeEdit(interaction, { embeds: [e] });
       }
 
-      setMinForChannel(guildId, channelId, v);
+      // /source
+      if (interaction.commandName === "source") {
+        const raw = interaction.options.getString("wallet") || "";
+        const source = raw.trim().replace(/^"+|"+$/g, "");
+        if (!looksLikeSolPubkey(source)) {
+          return safeEdit(interaction, { content: "❌ Source wallet không hợp lệ (pubkey Solana)." });
+        }
 
-      const e = new EmbedBuilder()
-        .setTitle("✅ Min Updated (This Channel)")
-        .setColor(0x9b59b6)
-        .setDescription(`**Channel:** <#${channelId}>\nMin SOL: **${v} SOL**`)
-        .setTimestamp(new Date());
+        setSourceForChannel(guildId, channelId, source);
 
-      return safeEdit(interaction, { embeds: [e] });
-    }
+        const e = new EmbedBuilder()
+          .setTitle("✅ Source Updated (This Channel)")
+          .setColor(0x3498db)
+          .setDescription(`**Channel:** <#${channelId}>\nSource:\n**${source}**\n\nLink: ${solscanTransfersUrl(source)}`)
+          .setTimestamp(new Date());
 
-    // /time
-    if (interaction.commandName === "time") {
-      const h = Number(interaction.options.getNumber("hours"));
-      if (!Number.isFinite(h) || h < 1 || h > 48) {
-        return safeEdit(interaction, { content: "❌ Hours không hợp lệ (1 → 48)." });
+        return safeEdit(interaction, { embeds: [e] });
       }
 
-      setTimeForChannel(guildId, channelId, h);
+      // /min
+      if (interaction.commandName === "min") {
+        const v = Number(interaction.options.getNumber("sol"));
+        if (!Number.isFinite(v) || v < 0) return safeEdit(interaction, { content: "❌ Min SOL không hợp lệ." });
 
-      const e = new EmbedBuilder()
-        .setTitle("✅ Time Window Updated (This Channel)")
-        .setColor(0xf39c12)
-        .setDescription(`**Channel:** <#${channelId}>\nTime window: **${h} giờ** (2 tx cũ nhất)`)
-        .setTimestamp(new Date());
+        setMinForChannel(guildId, channelId, v);
 
-      return safeEdit(interaction, { embeds: [e] });
-    }
+        const e = new EmbedBuilder()
+          .setTitle("✅ Min Updated (This Channel)")
+          .setColor(0x9b59b6)
+          .setDescription(`**Channel:** <#${channelId}>\nMin SOL: **${v} SOL**`)
+          .setTimestamp(new Date());
 
-    // /scan
-    if (interaction.commandName === "scan") {
-      const source = getSourceForChannel(guildId, channelId);
-      if (!source) {
-        return safeEdit(interaction, {
-          content: `⚠️ Channel này chưa set source. Dùng: \`/source "YourSourceWallet"\``,
-        });
+        return safeEdit(interaction, { embeds: [e] });
       }
 
-      const minSol = getMinForChannel(guildId, channelId);
-      const timeHours = getTimeForChannel(guildId, channelId);
+      // /time
+      if (interaction.commandName === "time") {
+        const h = Number(interaction.options.getNumber("hours"));
+        if (!Number.isFinite(h) || h < 1 || h > 48) {
+          return safeEdit(interaction, { content: "❌ Hours không hợp lệ (1 → 48)." });
+        }
 
-      const wRaw = interaction.options.getString("wallet") || "";
-      const w = wRaw.trim().replace(/^"+|"+$/g, "");
-      if (!looksLikeSolPubkey(w)) return safeEdit(interaction, { content: "❌ Wallet không hợp lệ." });
+        setTimeForChannel(guildId, channelId, h);
 
-      return runScanAndRespond(interaction, [w], source, minSol, timeHours, channelId);
-    }
+        const e = new EmbedBuilder()
+          .setTitle("✅ Time Window Updated (This Channel)")
+          .setColor(0xf39c12)
+          .setDescription(`**Channel:** <#${channelId}>\nTime window: **${h} giờ** (2 tx cũ nhất)`)
+          .setTimestamp(new Date());
 
-    // /scanlist
-    if (interaction.commandName === "scanlist") {
-      const source = getSourceForChannel(guildId, channelId);
-      if (!source) {
-        return safeEdit(interaction, {
-          content: `⚠️ Channel này chưa set source. Dùng: \`/source "YourSourceWallet"\``,
-        });
+        return safeEdit(interaction, { embeds: [e] });
       }
 
-      const minSol = getMinForChannel(guildId, channelId);
-      const timeHours = getTimeForChannel(guildId, channelId);
+      // /scan
+      if (interaction.commandName === "scan") {
+        const source = getSourceForChannel(guildId, channelId);
+        if (!source) {
+          return safeEdit(interaction, {
+            content: `⚠️ Channel này chưa set source. Dùng: \`/source "YourSourceWallet"\``,
+          });
+        }
 
-      const key = waitKey(guildId, interaction.user.id, channelId);
-      waiting.set(key, { expiresAt: Date.now() + 60_000, source, minSol, timeHours, channelId });
+        const minSol = getMinForChannel(guildId, channelId);
+        const timeHours = getTimeForChannel(guildId, channelId);
 
-      const e = new EmbedBuilder()
-        .setTitle("📝 Paste list hoặc upload .txt")
-        .setColor(0xf1c40f)
-        .setDescription(
-          `**Channel:** <#${channelId}>\n` +
-            `Trong **60 giây**, bạn có thể:\n` +
-            `1) Paste list ví nhiều dòng, hoặc\n` +
-            `2) Upload file **message.txt / .txt** (Discord auto tạo cũng được)\n\n` +
-            `**Source:** ${shortPk(source)}\n` +
-            `**Min:** ${minSol} SOL\n` +
-            `**Time window:** ${timeHours} giờ\n\n` +
-            `Ví dụ paste:\n\`"wallet1"\n"wallet2"\n"wallet3"\``
-        )
-        .setTimestamp(new Date());
+        const wRaw = interaction.options.getString("wallet") || "";
+        const w = wRaw.trim().replace(/^"+|"+$/g, "");
+        if (!looksLikeSolPubkey(w)) return safeEdit(interaction, { content: "❌ Wallet không hợp lệ." });
 
-      return safeEdit(interaction, { embeds: [e] });
+        return runScanAndRespond(interaction, [w], source, minSol, timeHours, channelId);
+      }
+
+      // /scanlist
+      if (interaction.commandName === "scanlist") {
+        const source = getSourceForChannel(guildId, channelId);
+        if (!source) {
+          return safeEdit(interaction, {
+            content: `⚠️ Channel này chưa set source. Dùng: \`/source "YourSourceWallet"\``,
+          });
+        }
+
+        const minSol = getMinForChannel(guildId, channelId);
+        const timeHours = getTimeForChannel(guildId, channelId);
+
+        const key = waitKey(guildId, interaction.user.id, channelId);
+        waiting.set(key, { expiresAt: Date.now() + 60_000, source, minSol, timeHours, channelId });
+
+        const e = new EmbedBuilder()
+          .setTitle("📝 Paste list hoặc upload .txt")
+          .setColor(0xf1c40f)
+          .setDescription(
+            `**Channel:** <#${channelId}>\n` +
+              `Trong **60 giây**, bạn có thể:\n` +
+              `1) Paste list ví nhiều dòng, hoặc\n` +
+              `2) Upload file **message.txt / .txt** (Discord auto tạo cũng được)\n\n` +
+              `**Source:** ${shortPk(source)}\n` +
+              `**Min:** ${minSol} SOL\n` +
+              `**Time window:** ${timeHours} giờ\n\n` +
+              `Ví dụ paste:\n\`"wallet1"\n"wallet2"\n"wallet3"\``
+          )
+          .setTimestamp(new Date());
+
+        return safeEdit(interaction, { embeds: [e] });
+      }
+
+      return safeEdit(interaction, { content: "⚠️ Command chưa được handle trong code." });
+    } catch (e) {
+      try {
+        if (interaction.deferred || interaction.replied) {
+          await interaction.editReply(`❌ Lỗi: ${e.message}`);
+        }
+      } catch {}
     }
-
-    // fallback: command không xử lý
-    return safeEdit(interaction, { content: "⚠️ Command chưa được handle trong code." });
-  } catch (e) {
-    return safeEdit(interaction, { content: `❌ Lỗi: ${e.message}` });
-  }
+  });
 });
 
 // ================== MESSAGE HANDLER FOR /scanlist ==================
