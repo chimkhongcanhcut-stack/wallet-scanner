@@ -26,7 +26,11 @@ const REQUEST_TIMEOUT_MS = 20_000;
 const STATE_FILE = path.join(__dirname, "state.json");
 const DEFAULT_SOURCE = "";
 
-// ================== STATE ==================
+// ================== STATE (PER-CHANNEL) ==================
+/**
+ * Key format: `${guildId}:${channelId}`
+ * state = { sources: {}, mins: {}, times: {} }
+ */
 let state = { sources: {}, mins: {}, times: {} };
 
 function loadState() {
@@ -49,30 +53,33 @@ function saveState() {
     console.log("⚠️ Cannot save state.json:", e.message);
   }
 }
-
-function getSourceForGuild(guildId) {
-  return state.sources[guildId] || DEFAULT_SOURCE;
+function scopeKey(guildId, channelId) {
+  return `${guildId}:${channelId}`;
 }
-function setSourceForGuild(guildId, source) {
-  state.sources[guildId] = source;
+
+function getSourceForChannel(guildId, channelId) {
+  return state.sources[scopeKey(guildId, channelId)] || DEFAULT_SOURCE;
+}
+function setSourceForChannel(guildId, channelId, source) {
+  state.sources[scopeKey(guildId, channelId)] = source;
   saveState();
 }
 
-function getMinForGuild(guildId) {
-  const v = state.mins[guildId];
+function getMinForChannel(guildId, channelId) {
+  const v = state.mins[scopeKey(guildId, channelId)];
   return typeof v === "number" && Number.isFinite(v) ? v : DEFAULT_MIN_SOL;
 }
-function setMinForGuild(guildId, minSol) {
-  state.mins[guildId] = minSol;
+function setMinForChannel(guildId, channelId, minSol) {
+  state.mins[scopeKey(guildId, channelId)] = minSol;
   saveState();
 }
 
-function getTimeForGuild(guildId) {
-  const v = state.times[guildId];
+function getTimeForChannel(guildId, channelId) {
+  const v = state.times[scopeKey(guildId, channelId)];
   return typeof v === "number" && Number.isFinite(v) ? v : DEFAULT_TIME_HOURS;
 }
-function setTimeForGuild(guildId, hours) {
-  state.times[guildId] = hours;
+function setTimeForChannel(guildId, channelId, hours) {
+  state.times[scopeKey(guildId, channelId)] = hours;
   saveState();
 }
 
@@ -222,7 +229,7 @@ async function scanWalletWithSource(wallet, sourceWallet, minSol, timeHours) {
     })
   );
 
-  // ✅ Time window check
+  // ✅ Time window check (CẢ 2 tx cũ nhất phải trong timeHours)
   const nowSec = Math.floor(Date.now() / 1000);
   const maxAgeSec = Math.floor(timeHours * 3600);
   for (const t of txs) {
@@ -232,10 +239,15 @@ async function scanWalletWithSource(wallet, sourceWallet, minSol, timeHours) {
 
   // ✅ White-ish check
   const isCond1 = sigs.length === 1 && txs[0]?.isTransferTx === true;
-  const isCond2 = sigs.length >= 2 && txs.length >= 2 && txs[0].isTransferTx && txs[1].isTransferTx;
+  const isCond2 =
+    sigs.length >= 2 &&
+    txs.length >= 2 &&
+    txs[0].isTransferTx &&
+    txs[1].isTransferTx;
+
   if (!isCond1 && !isCond2) return null;
 
-  // ✅ Funding condition (Source -> wallet, >= minSol)
+  // ✅ Funding condition in oldest 2 tx
   for (const t of txs) {
     for (const tr of t.transfers) {
       if (tr.from !== sourceWallet) continue;
@@ -266,11 +278,12 @@ async function scanWalletWithSource(wallet, sourceWallet, minSol, timeHours) {
 }
 
 // ================== PRETTY OUTPUT ==================
-function makeSummaryEmbed({ source, minSol, timeHours, scannedCount, hitCount }) {
+function makeSummaryEmbed({ source, minSol, timeHours, scannedCount, hitCount, channelId }) {
   return new EmbedBuilder()
-    .setTitle("🔎 Scan Result")
+    .setTitle("🔎 Scan Result (Channel Config)")
     .setColor(hitCount > 0 ? 0x2ecc71 : 0x95a5a6)
     .setDescription(
+      `**Channel:** <#${channelId}>\n` +
       `**Source:** ${source ? `[${shortPk(source)}](${solscanTransfersUrl(source)})` : "*chưa set*"}\n` +
       `**Min amount:** **${minSol} SOL**\n` +
       `**Time window:** **${timeHours} giờ** (2 tx cũ nhất)\n` +
@@ -316,7 +329,7 @@ function makeWalletButtons(hit) {
   );
 }
 
-async function runScanAndRespond(target, wallets, source, minSol, timeHours) {
+async function runScanAndRespond(target, wallets, source, minSol, timeHours, channelId) {
   const results = await mapLimit(wallets, CONCURRENCY, async (w) => {
     try {
       return await scanWalletWithSource(w, source, minSol, timeHours);
@@ -334,6 +347,7 @@ async function runScanAndRespond(target, wallets, source, minSol, timeHours) {
     timeHours,
     scannedCount: wallets.length,
     hitCount: hits.length,
+    channelId,
   });
 
   if ("editReply" in target) {
@@ -361,7 +375,7 @@ async function runScanAndRespond(target, wallets, source, minSol, timeHours) {
 }
 
 // ================== /scanlist WAITING ==================
-const waiting = new Map();
+const waiting = new Map(); // key = guild:user:channel
 function waitKey(guildId, userId, channelId) {
   return `${guildId}:${userId}:${channelId}`;
 }
@@ -370,21 +384,24 @@ function waitKey(guildId, userId, channelId) {
 client.on("interactionCreate", async (interaction) => {
   try {
     if (!interaction.isChatInputCommand()) return;
-    const guildId = interaction.guildId;
-    if (!guildId) return;
 
-    // /show
+    const guildId = interaction.guildId;
+    const channelId = interaction.channelId;
+    if (!guildId || !channelId) return;
+
+    // /show (per-channel)
     if (interaction.commandName === "show") {
       await interaction.deferReply();
 
-      const source = getSourceForGuild(guildId);
-      const minSol = getMinForGuild(guildId);
-      const timeHours = getTimeForGuild(guildId);
+      const source = getSourceForChannel(guildId, channelId);
+      const minSol = getMinForChannel(guildId, channelId);
+      const timeHours = getTimeForChannel(guildId, channelId);
 
       const e = new EmbedBuilder()
-        .setTitle("⚙️ Current Config")
+        .setTitle("⚙️ Current Config (This Channel)")
         .setColor(0x3498db)
         .setDescription(
+          `**Channel:** <#${channelId}>\n` +
           `**Source:** ${source ? `[${source}](${solscanTransfersUrl(source)})` : "*chưa set*"}\n` +
           `**Min SOL:** **${minSol}**\n` +
           `**Time window:** **${timeHours} giờ**\n\n` +
@@ -398,7 +415,7 @@ client.on("interactionCreate", async (interaction) => {
       return interaction.editReply({ embeds: [e] });
     }
 
-    // /source
+    // /source (per-channel)
     if (interaction.commandName === "source") {
       await interaction.deferReply();
 
@@ -407,36 +424,40 @@ client.on("interactionCreate", async (interaction) => {
       if (!looksLikeSolPubkey(source)) {
         return interaction.editReply("❌ Source wallet không hợp lệ (pubkey Solana).");
       }
-      setSourceForGuild(guildId, source);
+
+      setSourceForChannel(guildId, channelId, source);
 
       const e = new EmbedBuilder()
-        .setTitle("✅ Source Updated")
+        .setTitle("✅ Source Updated (This Channel)")
         .setColor(0x3498db)
-        .setDescription(`Source cho server này:\n**${source}**\n\nLink: ${solscanTransfersUrl(source)}`)
+        .setDescription(
+          `**Channel:** <#${channelId}>\n` +
+          `Source:\n**${source}**\n\nLink: ${solscanTransfersUrl(source)}`
+        )
         .setTimestamp(new Date());
 
       return interaction.editReply({ embeds: [e] });
     }
 
-    // /min
+    // /min (per-channel)
     if (interaction.commandName === "min") {
       await interaction.deferReply();
 
       const v = Number(interaction.options.getNumber("sol"));
       if (!Number.isFinite(v) || v < 0) return interaction.editReply("❌ Min SOL không hợp lệ.");
 
-      setMinForGuild(guildId, v);
+      setMinForChannel(guildId, channelId, v);
 
       const e = new EmbedBuilder()
-        .setTitle("✅ Min Updated")
+        .setTitle("✅ Min Updated (This Channel)")
         .setColor(0x9b59b6)
-        .setDescription(`Min SOL cho server này: **${v} SOL**`)
+        .setDescription(`**Channel:** <#${channelId}>\nMin SOL: **${v} SOL**`)
         .setTimestamp(new Date());
 
       return interaction.editReply({ embeds: [e] });
     }
 
-    // /time
+    // /time (per-channel)
     if (interaction.commandName === "time") {
       await interaction.deferReply();
 
@@ -445,12 +466,12 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply("❌ Hours không hợp lệ (1 → 48).");
       }
 
-      setTimeForGuild(guildId, h);
+      setTimeForChannel(guildId, channelId, h);
 
       const e = new EmbedBuilder()
-        .setTitle("✅ Time Window Updated")
+        .setTitle("✅ Time Window Updated (This Channel)")
         .setColor(0xf39c12)
-        .setDescription(`Time window cho server này: **${h} giờ** (áp dụng cho 2 tx cũ nhất)`)
+        .setDescription(`**Channel:** <#${channelId}>\nTime window: **${h} giờ** (2 tx cũ nhất)`)
         .setTimestamp(new Date());
 
       return interaction.editReply({ embeds: [e] });
@@ -460,35 +481,40 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.commandName === "scan") {
       await interaction.deferReply();
 
-      const source = getSourceForGuild(guildId);
-      if (!source) return interaction.editReply(`⚠️ Chưa set source. Dùng: \`/source "YourSourceWallet"\``);
+      const source = getSourceForChannel(guildId, channelId);
+      if (!source) {
+        return interaction.editReply(`⚠️ Channel này chưa set source. Dùng: \`/source "YourSourceWallet"\``);
+      }
 
-      const minSol = getMinForGuild(guildId);
-      const timeHours = getTimeForGuild(guildId);
+      const minSol = getMinForChannel(guildId, channelId);
+      const timeHours = getTimeForChannel(guildId, channelId);
 
       const w = interaction.options.getString("wallet").trim().replace(/^"+|"+$/g, "");
       if (!looksLikeSolPubkey(w)) return interaction.editReply("❌ Wallet không hợp lệ.");
 
-      return runScanAndRespond(interaction, [w], source, minSol, timeHours);
+      return runScanAndRespond(interaction, [w], source, minSol, timeHours, channelId);
     }
 
     // /scanlist
     if (interaction.commandName === "scanlist") {
       await interaction.deferReply();
 
-      const source = getSourceForGuild(guildId);
-      if (!source) return interaction.editReply(`⚠️ Chưa set source. Dùng: \`/source "YourSourceWallet"\``);
+      const source = getSourceForChannel(guildId, channelId);
+      if (!source) {
+        return interaction.editReply(`⚠️ Channel này chưa set source. Dùng: \`/source "YourSourceWallet"\``);
+      }
 
-      const minSol = getMinForGuild(guildId);
-      const timeHours = getTimeForGuild(guildId);
+      const minSol = getMinForChannel(guildId, channelId);
+      const timeHours = getTimeForChannel(guildId, channelId);
 
-      const key = waitKey(guildId, interaction.user.id, interaction.channelId);
-      waiting.set(key, { expiresAt: Date.now() + 60_000, source, minSol, timeHours });
+      const key = waitKey(guildId, interaction.user.id, channelId);
+      waiting.set(key, { expiresAt: Date.now() + 60_000, source, minSol, timeHours, channelId });
 
       const e = new EmbedBuilder()
         .setTitle("📝 Paste Wallet List")
         .setColor(0xf1c40f)
         .setDescription(
+          `**Channel:** <#${channelId}>\n` +
           `Paste list ví (mỗi dòng 1 ví) trong **60 giây**.\n\n` +
           `**Source:** ${shortPk(source)}\n` +
           `**Min:** ${minSol} SOL\n` +
@@ -527,7 +553,8 @@ client.on("messageCreate", async (msg) => {
     if (wallets.length === 0) return msg.reply("❌ Không thấy ví nào trong message bạn vừa paste.");
 
     await msg.reply(`⏳ Đang scan **${wallets.length}** ví...`);
-    return runScanAndRespond(msg, wallets, w.source, w.minSol, w.timeHours);
+
+    return runScanAndRespond(msg, wallets, w.source, w.minSol, w.timeHours, w.channelId);
   } catch {}
 });
 
@@ -548,6 +575,7 @@ client.on("messageCreate", async (msg) => {
     console.log(`✅ Bot logged in as ${c.user.tag}`);
     console.log(`💰 Default Min: ${DEFAULT_MIN_SOL} SOL`);
     console.log(`⏱ Default Time: ${DEFAULT_TIME_HOURS} hours`);
+    console.log(`🧩 Config scope: PER CHANNEL`);
   });
 
   await client.login(process.env.DISCORD_BOT_TOKEN);
