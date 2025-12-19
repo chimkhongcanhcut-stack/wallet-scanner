@@ -2,6 +2,7 @@ require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
+const { Worker } = require("worker_threads");
 const {
   Client,
   GatewayIntentBits,
@@ -11,15 +12,12 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  MessageFlags, // djs v14/v15 có, nếu không có vẫn fallback ở dưới
 } = require("discord.js");
 
-// ================== HARD LOG (để bắt lỗi defer/reply) ==================
-process.on("unhandledRejection", (err) => {
-  console.error("❌ unhandledRejection:", err);
-});
-process.on("uncaughtException", (err) => {
-  console.error("❌ uncaughtException:", err);
-});
+// ================== HARD LOG ==================
+process.on("unhandledRejection", (err) => console.error("❌ unhandledRejection:", err));
+process.on("uncaughtException", (err) => console.error("❌ uncaughtException:", err));
 
 // ================== CONFIG ==================
 const RPC_URL = process.env.RPC_URL;
@@ -36,6 +34,9 @@ const DEFAULT_SOURCE = "";
 
 // txt attachment limits
 const MAX_TXT_BYTES = 1_000_000; // 1MB đủ dùng; file quá lớn thì từ chối
+
+// Ephemeral flag (bit 6)
+const EPHEMERAL_FLAG = (MessageFlags && MessageFlags.Ephemeral) ? MessageFlags.Ephemeral : 1 << 6;
 
 // ================== STATE (PER-CHANNEL) ==================
 let state = { sources: {}, mins: {}, times: {} };
@@ -126,34 +127,25 @@ function shortPk(pk) {
   return `${pk.slice(0, 4)}…${pk.slice(-4)}`;
 }
 
-// ================== INTERACTION ACK HELPERS (FIX) ==================
+// ================== INTERACTION ACK HELPERS (FIX 10062) ==================
 async function safeDefer(interaction) {
   if (!interaction || interaction.deferred || interaction.replied) return true;
   try {
-    // ACK trong 3 giây — không làm gì trước dòng này
-    await interaction.deferReply({ ephemeral: false });
+    // ACK thật sớm
+    await interaction.deferReply({ ephemeral: false }); // v14 vẫn OK, v15 vẫn chạy (warning chỉ với ephemeral in reply options)
     return true;
   } catch (e) {
-    console.error("❌ deferReply failed:", {
-      code: e?.code,
-      message: e?.message,
-      name: e?.name,
-    });
-
-    // fallback: thử reply ephemeral để báo thiếu quyền (nếu được)
+    console.error("❌ deferReply failed:", { code: e?.code, message: e?.message, name: e?.name });
+    // fallback ephemeral bằng flags (tránh warning)
     try {
       await interaction.reply({
         content:
-          "❌ Bot không ACK được (thường do thiếu quyền trong channel). Cấp: View Channel + Send Messages + Embed Links + Use Application Commands.",
-        ephemeral: true,
+          "❌ Bot không ACK được (interaction đã hết hạn hoặc thiếu quyền). Nếu hay bị: do scan đang block event loop → hãy dùng bản worker (file này đã dùng worker).",
+        flags: EPHEMERAL_FLAG,
       });
       return true;
     } catch (e2) {
-      console.error("❌ reply fallback failed:", {
-        code: e2?.code,
-        message: e2?.message,
-        name: e2?.name,
-      });
+      console.error("❌ reply fallback failed:", { code: e2?.code, message: e2?.message, name: e2?.name });
       return false;
     }
   }
@@ -161,77 +153,12 @@ async function safeDefer(interaction) {
 
 async function safeEdit(interaction, payload) {
   try {
-    if (interaction.deferred || interaction.replied) {
+    if (interaction && (interaction.deferred || interaction.replied)) {
       return await interaction.editReply(payload);
     }
   } catch (e) {
-    console.error("❌ editReply failed:", {
-      code: e?.code,
-      message: e?.message,
-      name: e?.name,
-    });
+    console.error("❌ editReply failed:", { code: e?.code, message: e?.message, name: e?.name });
   }
-}
-
-// ================== RPC HELPERS ==================
-async function rpc(method, params) {
-  const res = await axios.post(
-    RPC_URL,
-    { jsonrpc: "2.0", id: 1, method, params },
-    {
-      timeout: REQUEST_TIMEOUT_MS,
-      headers: { "Content-Type": "application/json" },
-      validateStatus: () => true,
-    }
-  );
-  if (!res.data) throw new Error(`RPC empty response for ${method}`);
-  if (res.data.error) throw new Error(res.data.error.message || "RPC error");
-  return res.data.result;
-}
-async function getSignatures(address, limit = 50) {
-  return rpc("getSignaturesForAddress", [address, { limit }]);
-}
-async function getTx(signature) {
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      return await rpc("getTransaction", [
-        signature,
-        { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 },
-      ]);
-    } catch (e) {
-      if (attempt === 2) throw e;
-      await new Promise((r) => setTimeout(r, 350));
-    }
-  }
-  return null;
-}
-async function getSolBalance(wallet) {
-  const res = await rpc("getBalance", [wallet, { commitment: "confirmed" }]);
-  return Number(res?.value || 0) / 1e9;
-}
-function lamportsToSol(l) {
-  return l / 1_000_000_000;
-}
-function extractSystemTransfers(tx) {
-  const out = [];
-  if (!tx) return out;
-
-  for (const ix of tx?.transaction?.message?.instructions || []) {
-    if (ix?.program === "system" && ix?.parsed?.type === "transfer") {
-      const info = ix.parsed.info;
-      out.push({ from: info.source, to: info.destination, lamports: Number(info.lamports || 0) });
-    }
-  }
-  for (const group of tx?.meta?.innerInstructions || []) {
-    for (const ix of group?.instructions || []) {
-      if (ix?.program === "system" && ix?.parsed?.type === "transfer") {
-        const info = ix.parsed.info;
-        out.push({ from: info.source, to: info.destination, lamports: Number(info.lamports || 0) });
-      }
-    }
-  }
-
-  return out;
 }
 
 // ================== INPUT PARSE ==================
@@ -265,95 +192,13 @@ async function downloadAttachmentText(att) {
       `File quá lớn (${Math.round(size / 1024)}KB). Max ~${Math.round(MAX_TXT_BYTES / 1024)}KB.`
     );
   }
-
   const url = att.url;
   const res = await axios.get(url, { responseType: "text", timeout: REQUEST_TIMEOUT_MS });
   if (typeof res.data !== "string") throw new Error("Không đọc được nội dung file text.");
   return res.data;
 }
 
-// ================== CONCURRENCY ==================
-async function mapLimit(arr, limit, fn) {
-  const ret = new Array(arr.length);
-  let i = 0;
-  const workers = Array.from({ length: Math.min(limit, arr.length) }, () =>
-    (async () => {
-      while (true) {
-        const idx = i++;
-        if (idx >= arr.length) break;
-        ret[idx] = await fn(arr[idx], idx);
-      }
-    })()
-  );
-  await Promise.all(workers);
-  return ret;
-}
-
-// ================== SCAN LOGIC ==================
-async function scanWalletWithSource(wallet, sourceWallet, minSol, timeHours) {
-  const sigs = await getSignatures(wallet, SIG_FETCH_LIMIT);
-  if (!Array.isArray(sigs) || sigs.length === 0) return null;
-
-  const oldestTwo = sigs.slice(-2);
-
-  const txs = await Promise.all(
-    oldestTwo.map(async (s) => {
-      const sig = s.signature;
-      const tx = await getTx(sig);
-      const transfers = extractSystemTransfers(tx);
-      return {
-        sig,
-        blockTime: tx?.blockTime || null,
-        isTransferTx: transfers.length > 0,
-        transfers,
-      };
-    })
-  );
-
-  // Time window: cả 2 tx cũ nhất phải trong X giờ
-  const nowSec = Math.floor(Date.now() / 1000);
-  const maxAgeSec = Math.floor(timeHours * 3600);
-  for (const t of txs) {
-    if (!t.blockTime) return null;
-    if (nowSec - t.blockTime > maxAgeSec) return null;
-  }
-
-  // White-ish
-  const isCond1 = sigs.length === 1 && txs[0]?.isTransferTx === true;
-  const isCond2 = sigs.length >= 2 && txs.length >= 2 && txs[0].isTransferTx && txs[1].isTransferTx;
-  if (!isCond1 && !isCond2) return null;
-
-  // Funding from source -> wallet >= minSol (trong 2 tx cũ nhất)
-  for (const t of txs) {
-    for (const tr of t.transfers) {
-      if (tr.from !== sourceWallet) continue;
-      if (tr.to !== wallet) continue;
-
-      const sol = lamportsToSol(tr.lamports);
-      if (sol < minSol) continue;
-
-      const balance = await getSolBalance(wallet);
-
-      return {
-        wallet,
-        balance,
-        source: sourceWallet,
-        fundedSol: sol,
-        sig: t.sig,
-        fundingTime: formatTime(t.blockTime),
-        scannedAt: scanNowStr(),
-        txCondition: isCond1
-          ? "Điều kiện 1 (1 tx đầu là transfer)"
-          : "Điều kiện 2 (2 tx đầu đều transfer)",
-        timeRule: `${timeHours} giờ`,
-      };
-    }
-  }
-
-  return null;
-}
-
-// ================== PRETTY OUTPUT ==================
+// ================== PRETTY OUTPUT (GIỮ NGUYÊN) ==================
 function makeSummaryEmbed({ source, minSol, timeHours, scannedCount, hitCount, channelId }) {
   return new EmbedBuilder()
     .setTitle("🔎 Scan Result (Channel Config)")
@@ -394,22 +239,206 @@ function makeWalletEmbed(hit) {
 
 function makeWalletButtons(hit) {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setLabel("Open Transfers").setStyle(ButtonStyle.Link).setURL(solscanTransfersUrl(hit.wallet)),
-    new ButtonBuilder().setLabel("Open TX").setStyle(ButtonStyle.Link).setURL(solscanTxUrl(hit.sig))
+    new ButtonBuilder()
+      .setLabel("Open Transfers")
+      .setStyle(ButtonStyle.Link)
+      .setURL(solscanTransfersUrl(hit.wallet)),
+    new ButtonBuilder()
+      .setLabel("Open TX")
+      .setStyle(ButtonStyle.Link)
+      .setURL(solscanTxUrl(hit.sig))
   );
 }
 
-async function runScanAndRespond(target, wallets, source, minSol, timeHours, channelId) {
-  const results = await mapLimit(wallets, CONCURRENCY, async (w) => {
-    try {
-      return await scanWalletWithSource(w, source, minSol, timeHours);
-    } catch {
-      return null;
-    }
-  });
+// ================== WORKER SCAN (KHÔNG ĐỔI LOGIC, CHỈ TÁCH THREAD) ==================
+function runScanInWorker({ wallets, source, minSol, timeHours }) {
+  return new Promise((resolve, reject) => {
+    const workerCode = `
+      const axios = require("axios");
+      const { parentPort, workerData } = require("worker_threads");
 
-  const hits = results.filter(Boolean);
-  hits.sort((a, b) => b.fundedSol - a.fundedSol || b.balance - a.balance);
+      const RPC_URL = workerData.RPC_URL;
+      const SIG_FETCH_LIMIT = workerData.SIG_FETCH_LIMIT;
+      const CONCURRENCY = workerData.CONCURRENCY;
+      const REQUEST_TIMEOUT_MS = workerData.REQUEST_TIMEOUT_MS;
+
+      function scanNowStr() {
+        return new Date().toLocaleString("vi-VN", { timeZone: "Asia/Bangkok" });
+      }
+      function formatTime(blockTime) {
+        if (!blockTime) return "N/A";
+        return new Date(blockTime * 1000).toLocaleString("vi-VN", { timeZone: "Asia/Bangkok" });
+      }
+      function lamportsToSol(l) { return l / 1_000_000_000; }
+
+      async function rpc(method, params) {
+        const res = await axios.post(
+          RPC_URL,
+          { jsonrpc: "2.0", id: 1, method, params },
+          {
+            timeout: REQUEST_TIMEOUT_MS,
+            headers: { "Content-Type": "application/json" },
+            validateStatus: () => true,
+          }
+        );
+        if (!res.data) throw new Error(\`RPC empty response for \${method}\`);
+        if (res.data.error) throw new Error(res.data.error.message || "RPC error");
+        return res.data.result;
+      }
+      async function getSignatures(address, limit = 50) {
+        return rpc("getSignaturesForAddress", [address, { limit }]);
+      }
+      async function getTx(signature) {
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          try {
+            return await rpc("getTransaction", [
+              signature,
+              { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 },
+            ]);
+          } catch (e) {
+            if (attempt === 2) throw e;
+            await new Promise((r) => setTimeout(r, 350));
+          }
+        }
+        return null;
+      }
+      async function getSolBalance(wallet) {
+        const res = await rpc("getBalance", [wallet, { commitment: "confirmed" }]);
+        return Number(res?.value || 0) / 1e9;
+      }
+      function extractSystemTransfers(tx) {
+        const out = [];
+        if (!tx) return out;
+
+        for (const ix of tx?.transaction?.message?.instructions || []) {
+          if (ix?.program === "system" && ix?.parsed?.type === "transfer") {
+            const info = ix.parsed.info;
+            out.push({ from: info.source, to: info.destination, lamports: Number(info.lamports || 0) });
+          }
+        }
+        for (const group of tx?.meta?.innerInstructions || []) {
+          for (const ix of group?.instructions || []) {
+            if (ix?.program === "system" && ix?.parsed?.type === "transfer") {
+              const info = ix.parsed.info;
+              out.push({ from: info.source, to: info.destination, lamports: Number(info.lamports || 0) });
+            }
+          }
+        }
+        return out;
+      }
+
+      async function mapLimit(arr, limit, fn) {
+        const ret = new Array(arr.length);
+        let i = 0;
+        const workers = Array.from({ length: Math.min(limit, arr.length) }, () =>
+          (async () => {
+            while (true) {
+              const idx = i++;
+              if (idx >= arr.length) break;
+              ret[idx] = await fn(arr[idx], idx);
+            }
+          })()
+        );
+        await Promise.all(workers);
+        return ret;
+      }
+
+      async function scanWalletWithSource(wallet, sourceWallet, minSol, timeHours) {
+        const sigs = await getSignatures(wallet, SIG_FETCH_LIMIT);
+        if (!Array.isArray(sigs) || sigs.length === 0) return null;
+
+        const oldestTwo = sigs.slice(-2);
+
+        const txs = await Promise.all(
+          oldestTwo.map(async (s) => {
+            const sig = s.signature;
+            const tx = await getTx(sig);
+            const transfers = extractSystemTransfers(tx);
+            return {
+              sig,
+              blockTime: tx?.blockTime || null,
+              isTransferTx: transfers.length > 0,
+              transfers,
+            };
+          })
+        );
+
+        const nowSec = Math.floor(Date.now() / 1000);
+        const maxAgeSec = Math.floor(timeHours * 3600);
+        for (const t of txs) {
+          if (!t.blockTime) return null;
+          if (nowSec - t.blockTime > maxAgeSec) return null;
+        }
+
+        const isCond1 = sigs.length === 1 && txs[0]?.isTransferTx === true;
+        const isCond2 = sigs.length >= 2 && txs.length >= 2 && txs[0].isTransferTx && txs[1].isTransferTx;
+        if (!isCond1 && !isCond2) return null;
+
+        for (const t of txs) {
+          for (const tr of t.transfers) {
+            if (tr.from !== sourceWallet) continue;
+            if (tr.to !== wallet) continue;
+
+            const sol = lamportsToSol(tr.lamports);
+            if (sol < minSol) continue;
+
+            const balance = await getSolBalance(wallet);
+
+            return {
+              wallet,
+              balance,
+              source: sourceWallet,
+              fundedSol: sol,
+              sig: t.sig,
+              fundingTime: formatTime(t.blockTime),
+              scannedAt: scanNowStr(),
+              txCondition: isCond1
+                ? "Điều kiện 1 (1 tx đầu là transfer)"
+                : "Điều kiện 2 (2 tx đầu đều transfer)",
+              timeRule: \`\${timeHours} giờ\`,
+            };
+          }
+        }
+        return null;
+      }
+
+      (async () => {
+        const { wallets, source, minSol, timeHours } = workerData.job;
+        const results = await mapLimit(wallets, CONCURRENCY, async (w) => {
+          try { return await scanWalletWithSource(w, source, minSol, timeHours); }
+          catch { return null; }
+        });
+        const hits = results.filter(Boolean);
+        hits.sort((a, b) => (b.fundedSol - a.fundedSol) || (b.balance - a.balance));
+        parentPort.postMessage({ ok: true, hits });
+      })().catch((e) => parentPort.postMessage({ ok: false, error: e?.message || String(e) }));
+    `;
+
+    const worker = new Worker(workerCode, {
+      eval: true,
+      workerData: {
+        RPC_URL,
+        SIG_FETCH_LIMIT,
+        CONCURRENCY,
+        REQUEST_TIMEOUT_MS,
+        job: { wallets, source, minSol, timeHours },
+      },
+    });
+
+    worker.on("message", (msg) => {
+      if (msg && msg.ok) resolve(msg.hits || []);
+      else reject(new Error(msg?.error || "Worker error"));
+    });
+    worker.on("error", reject);
+    worker.on("exit", (code) => {
+      if (code !== 0) reject(new Error("Worker exited with code " + code));
+    });
+  });
+}
+
+// ================== RUN + RESPOND (GIỮ OUTPUT, CHỈ ĐỔI PHẦN SCAN SANG WORKER) ==================
+async function runScanAndRespond(target, wallets, source, minSol, timeHours, channelId) {
+  const hits = await runScanInWorker({ wallets, source, minSol, timeHours });
 
   const summary = makeSummaryEmbed({
     source,
@@ -454,11 +483,11 @@ function waitKey(guildId, userId, channelId) {
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
-  // ACK NGAY — nếu fail thì dừng (đỡ "did not respond")
+  // ACK NGAY (trước khi làm bất kỳ thứ gì)
   const ackOk = await safeDefer(interaction);
   if (!ackOk) return;
 
-  // Đẩy xử lý nặng sang tick sau để chắc chắn ACK đã đi
+  // Đẩy xử lý sang tick sau (đảm bảo ACK đã đi)
   setImmediate(async () => {
     try {
       const guildId = interaction.guildId;
@@ -495,13 +524,14 @@ client.on("interactionCreate", async (interaction) => {
         if (!looksLikeSolPubkey(source)) {
           return safeEdit(interaction, { content: "❌ Source wallet không hợp lệ (pubkey Solana)." });
         }
-
         setSourceForChannel(guildId, channelId, source);
 
         const e = new EmbedBuilder()
           .setTitle("✅ Source Updated (This Channel)")
           .setColor(0x3498db)
-          .setDescription(`**Channel:** <#${channelId}>\nSource:\n**${source}**\n\nLink: ${solscanTransfersUrl(source)}`)
+          .setDescription(
+            `**Channel:** <#${channelId}>\nSource:\n**${source}**\n\nLink: ${solscanTransfersUrl(source)}`
+          )
           .setTimestamp(new Date());
 
         return safeEdit(interaction, { embeds: [e] });
@@ -511,7 +541,6 @@ client.on("interactionCreate", async (interaction) => {
       if (interaction.commandName === "min") {
         const v = Number(interaction.options.getNumber("sol"));
         if (!Number.isFinite(v) || v < 0) return safeEdit(interaction, { content: "❌ Min SOL không hợp lệ." });
-
         setMinForChannel(guildId, channelId, v);
 
         const e = new EmbedBuilder()
@@ -529,7 +558,6 @@ client.on("interactionCreate", async (interaction) => {
         if (!Number.isFinite(h) || h < 1 || h > 48) {
           return safeEdit(interaction, { content: "❌ Hours không hợp lệ (1 → 48)." });
         }
-
         setTimeForChannel(guildId, channelId, h);
 
         const e = new EmbedBuilder()
@@ -549,7 +577,6 @@ client.on("interactionCreate", async (interaction) => {
             content: `⚠️ Channel này chưa set source. Dùng: \`/source "YourSourceWallet"\``,
           });
         }
-
         const minSol = getMinForChannel(guildId, channelId);
         const timeHours = getTimeForChannel(guildId, channelId);
 
@@ -557,6 +584,8 @@ client.on("interactionCreate", async (interaction) => {
         const w = wRaw.trim().replace(/^"+|"+$/g, "");
         if (!looksLikeSolPubkey(w)) return safeEdit(interaction, { content: "❌ Wallet không hợp lệ." });
 
+        // feedback nhanh
+        await safeEdit(interaction, { content: `⏳ Đang scan 1 ví...`, embeds: [] });
         return runScanAndRespond(interaction, [w], source, minSol, timeHours, channelId);
       }
 
@@ -590,7 +619,7 @@ client.on("interactionCreate", async (interaction) => {
           )
           .setTimestamp(new Date());
 
-        return safeEdit(interaction, { embeds: [e] });
+        return safeEdit(interaction, { embeds: [e], content: "" });
       }
 
       return safeEdit(interaction, { content: "⚠️ Command chưa được handle trong code." });
@@ -622,7 +651,7 @@ client.on("messageCreate", async (msg) => {
     // consume
     waiting.delete(key);
 
-    // 1) Prefer attachment .txt if exists
+    // Prefer attachment .txt if exists
     let rawText = msg.content || "";
     const att = pickTxtAttachment(msg);
 
@@ -665,6 +694,7 @@ client.on("messageCreate", async (msg) => {
     console.log(`⏱ Default Time: ${DEFAULT_TIME_HOURS} hours`);
     console.log(`🧩 Config scope: PER CHANNEL`);
     console.log(`📎 scanlist: supports .txt attachment`);
+    console.log(`🧵 Worker scan: ON (prevents interaction timeout)`);
   });
 
   await client.login(process.env.DISCORD_BOT_TOKEN);
