@@ -439,6 +439,30 @@ function waitKey(guildId, userId, channelId) {
 // ================== INTERACTIONS ==================
 client.on("interactionCreate", async (interaction) => {
   try {
+    // ================== AUTOCOMPLETE (/source wallet) ==================
+    if (interaction.isAutocomplete()) {
+      if (interaction.commandName !== "source") return;
+
+      const focused = interaction.options.getFocused(true); // { name, value }
+      if (!focused || focused.name !== "wallet") return;
+
+      const q = String(focused.value || "").toLowerCase();
+      const presets = getAllPresets();
+      const keys = Object.keys(presets).sort();
+
+      // filter: startsWith (mượt)
+      const results = keys
+        .filter((k) => k.startsWith(q))
+        .slice(0, 25)
+        .map((k) => ({
+          name: `${k} (${presets[k].slice(0, 4)}…${presets[k].slice(-4)})`,
+          value: k,
+        }));
+
+      return interaction.respond(results);
+    }
+
+    // ================== COMMANDS ==================
     if (!interaction.isChatInputCommand()) return;
 
     const guildId = interaction.guildId;
@@ -462,8 +486,8 @@ client.on("interactionCreate", async (interaction) => {
             `**Min SOL:** **${minSol}**\n` +
             `**Time window:** **${timeHours} giờ**\n\n` +
             `Dùng:\n` +
-            `- \`/source wallet:<pubkey>\`\n` +
-            `- \`/source wallet:<presetName>\`\n` +
+            `- \`/source wallet:<pubkey>\` (như cũ)\n` +
+            `- \`/source wallet:<presetName>\` (mới)\n` +
             `- \`/preset add name:<name> wallet:<pubkey>\`\n` +
             `- \`/preset del name:<name>\`\n` +
             `- \`/preset list\`\n` +
@@ -555,7 +579,7 @@ client.on("interactionCreate", async (interaction) => {
           "❌ Source không hợp lệ.\n" +
             "Bạn có thể:\n" +
             `- Nhập pubkey: \`/source wallet:5tzF...\`\n` +
-            `- Hoặc preset name: \`/source wallet:kucoin\`\n` +
+            `- Hoặc preset name: \`/source wallet:kucoin\` (gõ ku sẽ có suggestion)\n` +
             `- Quản lý preset: \`/preset add/del/list\``
         );
       }
@@ -733,7 +757,7 @@ client.on("messageCreate", async (msg) => {
     console.log(`⏱ Default Time: ${DEFAULT_TIME_HOURS} hours`);
     console.log(`🧩 Config scope: PER CHANNEL`);
     console.log(`📎 scanlist: supports .txt attachment`);
-    console.log(`📌 presets: /preset add|del|list | /source wallet:<presetName or pubkey>`);
+    console.log(`✨ autocomplete: /source wallet:<presetName>`);
   });
 
   await client.login(process.env.DISCORD_BOT_TOKEN);
