@@ -30,19 +30,22 @@ const DEFAULT_SOURCE = "";
 const MAX_TXT_BYTES = 1_000_000; // 1MB đủ dùng; file quá lớn thì từ chối
 
 // ================== STATE (PER-CHANNEL) ==================
-let state = { sources: {}, mins: {}, times: {} };
+let state = { sources: {}, mins: {}, times: {}, presets: {} };
 
 function loadState() {
   try {
     if (fs.existsSync(STATE_FILE)) {
       state = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-      if (!state || typeof state !== "object") state = { sources: {}, mins: {}, times: {} };
+      if (!state || typeof state !== "object")
+        state = { sources: {}, mins: {}, times: {}, presets: {} };
+
       if (!state.sources || typeof state.sources !== "object") state.sources = {};
       if (!state.mins || typeof state.mins !== "object") state.mins = {};
       if (!state.times || typeof state.times !== "object") state.times = {};
+      if (!state.presets || typeof state.presets !== "object") state.presets = {};
     }
   } catch {
-    state = { sources: {}, mins: {}, times: {} };
+    state = { sources: {}, mins: {}, times: {}, presets: {} };
   }
 }
 function saveState() {
@@ -87,6 +90,50 @@ function looksLikeSolPubkey(s) {
   const t = s.trim();
   if (t.length < 32 || t.length > 50) return false;
   return /^[1-9A-HJ-NP-Za-km-z]+$/.test(t);
+}
+
+// ================== SOURCE PRESETS (DEFAULT + USER) ==================
+const DEFAULT_SOURCE_PRESETS = {
+  kucoin: "BmFdpraQhkiDQE6SnfG5omcA1VwzqfXrwtNYBwWTymy6",
+  binance: "5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9",
+};
+
+function normalizeSourceInput(s) {
+  return String(s || "")
+    .trim()
+    .replace(/^"+|"+$/g, "")
+    .toLowerCase();
+}
+
+function isValidPresetName(name) {
+  // cho phép a-z 0-9 _ - . (ngắn gọn, dễ gõ)
+  return /^[a-z0-9_.-]{2,32}$/.test(name);
+}
+
+function getAllPresets() {
+  // user preset override default preset nếu trùng key
+  return { ...DEFAULT_SOURCE_PRESETS, ...(state.presets || {}) };
+}
+
+function getPreset(name) {
+  const all = getAllPresets();
+  return all[name] || null;
+}
+
+function setPreset(name, wallet) {
+  if (!state.presets || typeof state.presets !== "object") state.presets = {};
+  state.presets[name] = wallet;
+  saveState();
+}
+
+function delPreset(name) {
+  if (!state.presets || typeof state.presets !== "object") state.presets = {};
+  if (state.presets[name]) {
+    delete state.presets[name];
+    saveState();
+    return true;
+  }
+  return false;
 }
 
 // ================== DISCORD CLIENT ==================
@@ -195,7 +242,6 @@ function pickTxtAttachment(msg) {
   const atts = [...msg.attachments.values()];
   if (atts.length === 0) return null;
 
-  // pick first .txt (hoặc message.txt) theo thứ tự ưu tiên
   const byName = (a) => (a.name || "").toLowerCase();
   const isTxt = (a) => byName(a).endsWith(".txt") || byName(a) === "message.txt";
   const txt = atts.find(isTxt);
@@ -207,10 +253,11 @@ function pickTxtAttachment(msg) {
 }
 
 async function downloadAttachmentText(att) {
-  // limit size
   const size = Number(att.size || 0);
   if (size > MAX_TXT_BYTES) {
-    throw new Error(`File quá lớn (${Math.round(size / 1024)}KB). Max ~${Math.round(MAX_TXT_BYTES / 1024)}KB.`);
+    throw new Error(
+      `File quá lớn (${Math.round(size / 1024)}KB). Max ~${Math.round(MAX_TXT_BYTES / 1024)}KB.`
+    );
   }
 
   const url = att.url;
@@ -307,11 +354,11 @@ function makeSummaryEmbed({ source, minSol, timeHours, scannedCount, hitCount, c
     .setColor(hitCount > 0 ? 0x2ecc71 : 0x95a5a6)
     .setDescription(
       `**Channel:** <#${channelId}>\n` +
-      `**Source:** ${source ? `[${shortPk(source)}](${solscanTransfersUrl(source)})` : "*chưa set*"}\n` +
-      `**Min amount:** **${minSol} SOL**\n` +
-      `**Time window:** **${timeHours} giờ** (2 tx cũ nhất)\n` +
-      `**Scanned:** **${scannedCount}** • **Matched:** **${hitCount}**\n` +
-      `**Scan time:** **${scanNowStr()}**`
+        `**Source:** ${source ? `[${shortPk(source)}](${solscanTransfersUrl(source)})` : "*chưa set*"}\n` +
+        `**Min amount:** **${minSol} SOL**\n` +
+        `**Time window:** **${timeHours} giờ** (2 tx cũ nhất)\n` +
+        `**Scanned:** **${scannedCount}** • **Matched:** **${hitCount}**\n` +
+        `**Scan time:** **${scanNowStr()}**`
     )
     .setTimestamp(new Date());
 }
@@ -326,14 +373,14 @@ function makeWalletEmbed(hit) {
     .setColor(0x2ecc71)
     .setDescription(
       `**Wallet:** [${hit.wallet}](${transfersLink})\n` +
-      `**Balance:** **${Number(hit.balance || 0).toFixed(3)} SOL**\n\n` +
-      `**Tx:** **${hit.txCondition}**\n` +
-      `**Funding time:** **${hit.fundingTime}**\n` +
-      `**Scanned at:** **${hit.scannedAt}**\n` +
-      `**Time rule:** **${hit.timeRule}**\n\n` +
-      `**Source:** [${shortPk(hit.source)}](${solscanTransfersUrl(hit.source)})\n` +
-      `**Amount from source:** **${hit.fundedSol.toFixed(3)} SOL**\n` +
-      `**TX:** [Open on Solscan](${txLink})`
+        `**Balance:** **${Number(hit.balance || 0).toFixed(3)} SOL**\n\n` +
+        `**Tx:** **${hit.txCondition}**\n` +
+        `**Funding time:** **${hit.fundingTime}**\n` +
+        `**Scanned at:** **${hit.scannedAt}**\n` +
+        `**Time rule:** **${hit.timeRule}**\n\n` +
+        `**Source:** [${shortPk(hit.source)}](${solscanTransfersUrl(hit.source)})\n` +
+        `**Amount from source:** **${hit.fundedSol.toFixed(3)} SOL**\n` +
+        `**TX:** [Open on Solscan](${txLink})`
     )
     .setFooter({ text: "Solana White-ish Funding Scanner" })
     .setTimestamp(new Date());
@@ -341,14 +388,8 @@ function makeWalletEmbed(hit) {
 
 function makeWalletButtons(hit) {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setLabel("Open Transfers")
-      .setStyle(ButtonStyle.Link)
-      .setURL(solscanTransfersUrl(hit.wallet)),
-    new ButtonBuilder()
-      .setLabel("Open TX")
-      .setStyle(ButtonStyle.Link)
-      .setURL(solscanTxUrl(hit.sig))
+    new ButtonBuilder().setLabel("Open Transfers").setStyle(ButtonStyle.Link).setURL(solscanTransfersUrl(hit.wallet)),
+    new ButtonBuilder().setLabel("Open TX").setStyle(ButtonStyle.Link).setURL(solscanTxUrl(hit.sig))
   );
 }
 
@@ -362,7 +403,7 @@ async function runScanAndRespond(target, wallets, source, minSol, timeHours, cha
   });
 
   const hits = results.filter(Boolean);
-  hits.sort((a, b) => (b.fundedSol - a.fundedSol) || (b.balance - a.balance));
+  hits.sort((a, b) => b.fundedSol - a.fundedSol || b.balance - a.balance);
 
   const summary = makeSummaryEmbed({
     source,
@@ -425,33 +466,121 @@ client.on("interactionCreate", async (interaction) => {
         .setColor(0x3498db)
         .setDescription(
           `**Channel:** <#${channelId}>\n` +
-          `**Source:** ${source ? `[${source}](${solscanTransfersUrl(source)})` : "*chưa set*"}\n` +
-          `**Min SOL:** **${minSol}**\n` +
-          `**Time window:** **${timeHours} giờ**\n\n` +
-          `Dùng:\n- \`/source "wallet"\`\n- \`/min sol:50\`\n- \`/time hours:5\``
+            `**Source:** ${source ? `[${source}](${solscanTransfersUrl(source)})` : "*chưa set*"}\n` +
+            `**Min SOL:** **${minSol}**\n` +
+            `**Time window:** **${timeHours} giờ**\n\n` +
+            `Dùng:\n` +
+            `- \`/source "wallet"\` (set pubkey)\n` +
+            `- \`/source kucoin\`\n` +
+            `- \`/source binance\`\n` +
+            `- \`/source add <name> <pubkey>\`\n` +
+            `- \`/source list\`\n` +
+            `- \`/source del <name>\`\n` +
+            `- \`/min sol:50\`\n` +
+            `- \`/time hours:5\``
         )
         .setTimestamp(new Date());
 
       return interaction.editReply({ embeds: [e] });
     }
 
-    // /source
+    // /source (preset + add/list/del + pubkey)
     if (interaction.commandName === "source") {
       await interaction.deferReply();
 
-      const raw = interaction.options.getString("wallet");
-      const source = raw.trim().replace(/^"+|"+$/g, "");
-      if (!looksLikeSolPubkey(source)) {
-        return interaction.editReply("❌ Source wallet không hợp lệ (pubkey Solana).");
+      const raw = interaction.options.getString("wallet") || "";
+      const text = String(raw).trim().replace(/^"+|"+$/g, "");
+      const tokens = text.split(/\s+/).filter(Boolean);
+      const cmd = normalizeSourceInput(tokens[0] || "");
+
+      // /source list
+      if (cmd === "list") {
+        const all = getAllPresets();
+        const keys = Object.keys(all).sort();
+        if (keys.length === 0) return interaction.editReply("⚠️ Chưa có preset nào.");
+
+        const lines = keys.slice(0, 80).map((k) => `- **${k}** → \`${all[k]}\``);
+        const more = keys.length > 80 ? `\n… và còn **${keys.length - 80}** preset nữa.` : "";
+
+        const e = new EmbedBuilder()
+          .setTitle("📌 Source Presets")
+          .setColor(0x3498db)
+          .setDescription(lines.join("\n") + more + `\n\nDùng: \`/source <name>\``)
+          .setTimestamp(new Date());
+
+        return interaction.editReply({ embeds: [e] });
+      }
+
+      // /source add <name> <pubkey>
+      if (cmd === "add") {
+        const name = normalizeSourceInput(tokens[1] || "");
+        const pk = String(tokens[2] || "").trim().replace(/^"+|"+$/g, "");
+
+        if (!name || !isValidPresetName(name)) {
+          return interaction.editReply(
+            "❌ Tên preset không hợp lệ.\n" +
+              "Format: `/source add <name> <pubkey>`\n" +
+              "Tên cho phép: a-z 0-9 và _ - . (2-32 ký tự)"
+          );
+        }
+        if (!looksLikeSolPubkey(pk)) {
+          return interaction.editReply("❌ Pubkey không hợp lệ.\nFormat: `/source add <name> <pubkey>`");
+        }
+
+        setPreset(name, pk);
+
+        const e = new EmbedBuilder()
+          .setTitle("✅ Preset Added")
+          .setColor(0x2ecc71)
+          .setDescription(`**Name:** **${name}**\n**Wallet:** \`${pk}\`\n\nDùng ngay: \`/source ${name}\``)
+          .setTimestamp(new Date());
+
+        return interaction.editReply({ embeds: [e] });
+      }
+
+      // /source del <name>
+      if (cmd === "del" || cmd === "delete" || cmd === "rm" || cmd === "remove") {
+        const name = normalizeSourceInput(tokens[1] || "");
+        if (!name) return interaction.editReply("❌ Format: `/source del <name>`");
+
+        const ok = delPreset(name);
+        if (!ok) {
+          return interaction.editReply(
+            `⚠️ Không tìm thấy preset **${name}** trong user presets.\nTip: dùng \`/source list\` để xem danh sách.`
+          );
+        }
+        return interaction.editReply(`✅ Đã xoá preset **${name}**.`);
+      }
+
+      // /source <presetName> OR /source <pubkey>
+      const normalized = normalizeSourceInput(text);
+      const presetWallet = getPreset(normalized);
+
+      let source = presetWallet;
+      if (!source) {
+        const maybePk = text;
+        if (!looksLikeSolPubkey(maybePk)) {
+          return interaction.editReply(
+            "❌ Source không hợp lệ.\n" +
+              "Bạn có thể dùng:\n" +
+              "- `/source <pubkey>`\n" +
+              "- `/source <presetName>`\n" +
+              "- `/source add <name> <pubkey>`\n" +
+              "- `/source list`"
+          );
+        }
+        source = maybePk;
       }
 
       setSourceForChannel(guildId, channelId, source);
+
+      const presetHit = presetWallet ? ` (preset: **${normalized}**)` : "";
 
       const e = new EmbedBuilder()
         .setTitle("✅ Source Updated (This Channel)")
         .setColor(0x3498db)
         .setDescription(
-          `**Channel:** <#${channelId}>\nSource:\n**${source}**\n\nLink: ${solscanTransfersUrl(source)}`
+          `**Channel:** <#${channelId}>\nSource:${presetHit}\n**${source}**\n\nLink: ${solscanTransfersUrl(source)}`
         )
         .setTimestamp(new Date());
 
@@ -534,13 +663,13 @@ client.on("interactionCreate", async (interaction) => {
         .setColor(0xf1c40f)
         .setDescription(
           `**Channel:** <#${channelId}>\n` +
-          `Trong **60 giây**, bạn có thể:\n` +
-          `1) Paste list ví nhiều dòng, hoặc\n` +
-          `2) Upload file **message.txt / .txt** (Discord auto tạo cũng được)\n\n` +
-          `**Source:** ${shortPk(source)}\n` +
-          `**Min:** ${minSol} SOL\n` +
-          `**Time window:** ${timeHours} giờ\n\n` +
-          `Ví dụ paste:\n\`"wallet1"\n"wallet2"\n"wallet3"\``
+            `Trong **60 giây**, bạn có thể:\n` +
+            `1) Paste list ví nhiều dòng, hoặc\n` +
+            `2) Upload file **message.txt / .txt** (Discord auto tạo cũng được)\n\n` +
+            `**Source:** ${shortPk(source)}\n` +
+            `**Min:** ${minSol} SOL\n` +
+            `**Time window:** ${timeHours} giờ\n\n` +
+            `Ví dụ paste:\n\`"wallet1"\n"wallet2"\n"wallet3"\``
         )
         .setTimestamp(new Date());
 
@@ -571,7 +700,7 @@ client.on("messageCreate", async (msg) => {
     // consume
     waiting.delete(key);
 
-    // 1) Prefer attachment .txt if exists
+    // Prefer attachment .txt if exists
     let rawText = msg.content || "";
     const att = pickTxtAttachment(msg);
 
@@ -614,6 +743,7 @@ client.on("messageCreate", async (msg) => {
     console.log(`⏱ Default Time: ${DEFAULT_TIME_HOURS} hours`);
     console.log(`🧩 Config scope: PER CHANNEL`);
     console.log(`📎 scanlist: supports .txt attachment`);
+    console.log(`📌 presets: /source list | /source add <name> <pubkey> | /source del <name>`);
   });
 
   await client.login(process.env.DISCORD_BOT_TOKEN);
