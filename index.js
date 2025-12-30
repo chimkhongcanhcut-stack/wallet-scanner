@@ -222,6 +222,38 @@ function extractSystemTransfers(tx) {
   return out;
 }
 
+// ================== INITIAL BALANCE CHECK ==================
+function getWalletPrePostLamports(tx, wallet) {
+  try {
+    const keys = tx?.transaction?.message?.accountKeys || [];
+    const pick = (k) => (typeof k === "string" ? k : k?.pubkey);
+
+    const idx = keys.findIndex((k) => pick(k) === wallet);
+    if (idx < 0) return { idx: -1, pre: null, post: null };
+
+    const pre = tx?.meta?.preBalances?.[idx];
+    const post = tx?.meta?.postBalances?.[idx];
+    return {
+      idx,
+      pre: typeof pre === "number" ? pre : null,
+      post: typeof post === "number" ? post : null,
+    };
+  } catch {
+    return { idx: -1, pre: null, post: null };
+  }
+}
+
+function getFeePayer(tx) {
+  try {
+    const keys = tx?.transaction?.message?.accountKeys || [];
+    if (!keys.length) return null;
+    const k0 = keys[0];
+    return typeof k0 === "string" ? k0 : k0?.pubkey || null;
+  } catch {
+    return null;
+  }
+}
+
 // ================== INPUT PARSE ==================
 function parseWallets(raw) {
   return raw
@@ -249,7 +281,9 @@ function pickTxtAttachment(msg) {
 async function downloadAttachmentText(att) {
   const size = Number(att.size || 0);
   if (size > MAX_TXT_BYTES) {
-    throw new Error(`File quá lớn (${Math.round(size / 1024)}KB). Max ~${Math.round(MAX_TXT_BYTES / 1024)}KB.`);
+    throw new Error(
+      `File quá lớn (${Math.round(size / 1024)}KB). Max ~${Math.round(MAX_TXT_BYTES / 1024)}KB.`
+    );
   }
 
   const url = att.url;
@@ -276,44 +310,49 @@ async function mapLimit(arr, limit, fn) {
 }
 
 // ================== SCAN LOGIC ==================
+// ✅ CHANGE ONLY: remove "2 tx cũ nhất / white-ish oldest" rule.
+// Now: within time window, find ANY tx that funds wallet from source and wallet preBalance==0 (initial balance = 0)
 async function scanWalletWithSource(wallet, sourceWallet, minSol, timeHours) {
   const sigs = await getSignatures(wallet, SIG_FETCH_LIMIT);
   if (!Array.isArray(sigs) || sigs.length === 0) return null;
 
-  const oldestTwo = sigs.slice(-2);
-
-  const txs = await Promise.all(
-    oldestTwo.map(async (s) => {
-      const sig = s.signature;
-      const tx = await getTx(sig);
-      const transfers = extractSystemTransfers(tx);
-      return {
-        sig,
-        blockTime: tx?.blockTime || null,
-        isTransferTx: transfers.length > 0,
-        transfers,
-      };
-    })
-  );
-
-  // Time window: cả 2 tx cũ nhất phải trong X giờ
   const nowSec = Math.floor(Date.now() / 1000);
   const maxAgeSec = Math.floor(timeHours * 3600);
-  for (const t of txs) {
-    if (!t.blockTime) return null;
-    if (nowSec - t.blockTime > maxAgeSec) return null;
-  }
 
-  // White-ish
-  const isCond1 = sigs.length === 1 && txs[0]?.isTransferTx === true;
-  const isCond2 = sigs.length >= 2 && txs.length >= 2 && txs[0].isTransferTx && txs[1].isTransferTx;
-  if (!isCond1 && !isCond2) return null;
+  // scan trong window (newest -> older)
+  for (const s of sigs) {
+    const sig = s.signature;
+    if (!sig) continue;
 
-  // Funding from source -> wallet >= minSol (trong 2 tx cũ nhất)
-  for (const t of txs) {
-    for (const tr of t.transfers) {
-      if (tr.from !== sourceWallet) continue;
+    // quick filter by signature blockTime
+    if (s.blockTime && nowSec - s.blockTime > maxAgeSec) continue;
+
+    let tx;
+    try {
+      tx = await getTx(sig);
+    } catch {
+      continue;
+    }
+    if (!tx?.blockTime) continue;
+    if (nowSec - tx.blockTime > maxAgeSec) continue;
+
+    const transfers = extractSystemTransfers(tx);
+    if (!transfers.length) continue;
+
+    // rule: wallet initial balance = 0 at this tx
+    const pp = getWalletPrePostLamports(tx, wallet);
+    const preOk = pp.pre === 0;
+    const fallbackOk = pp.pre === null && typeof pp.post === "number" && pp.post > 0;
+    if (!preOk && !fallbackOk) continue;
+
+    const feePayer = getFeePayer(tx);
+
+    // Funding from source -> wallet >= minSol (any tx in window)
+    for (const tr of transfers) {
       if (tr.to !== wallet) continue;
+
+      const sourceOk = tr.from === sourceWallet || feePayer === sourceWallet;
+      if (!sourceOk) continue;
 
       const sol = lamportsToSol(tr.lamports);
       if (sol < minSol) continue;
@@ -325,12 +364,10 @@ async function scanWalletWithSource(wallet, sourceWallet, minSol, timeHours) {
         balance,
         source: sourceWallet,
         fundedSol: sol,
-        sig: t.sig,
-        fundingTime: formatTime(t.blockTime),
+        sig,
+        fundingTime: formatTime(tx.blockTime),
         scannedAt: scanNowStr(),
-        txCondition: isCond1
-          ? "Điều kiện 1 (1 tx đầu là transfer)"
-          : "Điều kiện 2 (2 tx đầu đều transfer)",
+        txCondition: "Funding trong time window + initial balance = 0",
         timeRule: `${timeHours} giờ`,
       };
     }
@@ -348,7 +385,8 @@ function makeSummaryEmbed({ source, minSol, timeHours, scannedCount, hitCount, c
       `**Channel:** <#${channelId}>\n` +
         `**Source:** ${source ? `[${shortPk(source)}](${solscanTransfersUrl(source)})` : "*chưa set*"}\n` +
         `**Min amount:** **${minSol} SOL**\n` +
-        `**Time window:** **${timeHours} giờ** (2 tx cũ nhất)\n` +
+        `**Rule:** **initial balance = 0**\n` +
+        `**Time window:** **${timeHours} giờ** (within window)\n` +
         `**Scanned:** **${scannedCount}** • **Matched:** **${hitCount}**\n` +
         `**Scan time:** **${scanNowStr()}**`
     )
@@ -374,7 +412,7 @@ function makeWalletEmbed(hit) {
         `**Amount from source:** **${hit.fundedSol.toFixed(3)} SOL**\n` +
         `**TX:** [Open on Solscan](${txLink})`
     )
-    .setFooter({ text: "Solana White-ish Funding Scanner" })
+    .setFooter({ text: "Solana Funding Scanner" })
     .setTimestamp(new Date());
 }
 
@@ -443,14 +481,13 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isAutocomplete()) {
       if (interaction.commandName !== "source") return;
 
-      const focused = interaction.options.getFocused(true); // { name, value }
+      const focused = interaction.options.getFocused(true);
       if (!focused || focused.name !== "wallet") return;
 
       const q = String(focused.value || "").toLowerCase();
       const presets = getAllPresets();
       const keys = Object.keys(presets).sort();
 
-      // filter: startsWith (mượt)
       const results = keys
         .filter((k) => k.startsWith(q))
         .slice(0, 25)
@@ -484,6 +521,7 @@ client.on("interactionCreate", async (interaction) => {
           `**Channel:** <#${channelId}>\n` +
             `**Source:** ${source ? `[${source}](${solscanTransfersUrl(source)})` : "*chưa set*"}\n` +
             `**Min SOL:** **${minSol}**\n` +
+            `**Rule:** **initial balance = 0**\n` +
             `**Time window:** **${timeHours} giờ**\n\n` +
             `Dùng:\n` +
             `- \`/source wallet:<pubkey>\` (như cũ)\n` +
@@ -492,7 +530,7 @@ client.on("interactionCreate", async (interaction) => {
             `- \`/preset del name:<name>\`\n` +
             `- \`/preset list\`\n` +
             `- \`/min sol:50\`\n` +
-            `- \`/time hours:5\``
+            `- \`/time hours:168\``
         )
         .setTimestamp(new Date());
 
@@ -567,13 +605,11 @@ client.on("interactionCreate", async (interaction) => {
       const raw = interaction.options.getString("wallet");
       const input = String(raw || "").trim().replace(/^"+|"+$/g, "");
 
-      // Try preset
       const name = normalizePresetName(input);
       const presetWallet = getPreset(name);
 
       let source = presetWallet || input;
 
-      // If not preset, must be pubkey
       if (!presetWallet && !looksLikeSolPubkey(source)) {
         return interaction.editReply(
           "❌ Source không hợp lệ.\n" +
@@ -624,8 +660,8 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.deferReply();
 
       const h = Number(interaction.options.getNumber("hours"));
-      if (!Number.isFinite(h) || h < 1 || h > 48) {
-        return interaction.editReply("❌ Hours không hợp lệ (1 → 48).");
+      if (!Number.isFinite(h) || h < 1 || h > 168) {
+        return interaction.editReply("❌ Hours không hợp lệ (1 → 168).");
       }
 
       setTimeForChannel(guildId, channelId, h);
@@ -633,7 +669,7 @@ client.on("interactionCreate", async (interaction) => {
       const e = new EmbedBuilder()
         .setTitle("✅ Time Window Updated (This Channel)")
         .setColor(0xf39c12)
-        .setDescription(`**Channel:** <#${channelId}>\nTime window: **${h} giờ** (2 tx cũ nhất)`)
+        .setDescription(`**Channel:** <#${channelId}>\nTime window: **${h} giờ** (within window)`)
         .setTimestamp(new Date());
 
       return interaction.editReply({ embeds: [e] });
@@ -682,7 +718,8 @@ client.on("interactionCreate", async (interaction) => {
             `2) Upload file **message.txt / .txt** (Discord auto tạo cũng được)\n\n` +
             `**Source:** ${shortPk(source)}\n` +
             `**Min:** ${minSol} SOL\n` +
-            `**Time window:** ${timeHours} giờ\n\n` +
+            `**Time window:** ${timeHours} giờ\n` +
+            `**Rule:** initial balance = 0\n\n` +
             `Ví dụ paste:\n\`"wallet1"\n"wallet2"\n"wallet3"\``
         )
         .setTimestamp(new Date());
@@ -758,6 +795,7 @@ client.on("messageCreate", async (msg) => {
     console.log(`🧩 Config scope: PER CHANNEL`);
     console.log(`📎 scanlist: supports .txt attachment`);
     console.log(`✨ autocomplete: /source wallet:<presetName>`);
+    console.log(`🎯 scan rule: within window, funding from source, wallet preBalance==0`);
   });
 
   await client.login(process.env.DISCORD_BOT_TOKEN);
