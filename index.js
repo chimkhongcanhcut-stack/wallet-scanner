@@ -194,8 +194,12 @@ function nowSec() {
   return Math.floor(Date.now() / 1000);
 }
 function isOlderThanWindow(blockTime, timeHours) {
-  if (!blockTime || !Number.isFinite(blockTime)) return false; // unknown => can't skip
-  const maxAge = Math.floor(Number(timeHours) * 3600);
+  if (!Number.isFinite(blockTime)) return false;
+
+  // nếu blockTime lớn hơn hiện tại > 1 ngày => chắc chắn là SLOT → bỏ check
+  if (blockTime > nowSec() + 86400) return false;
+
+  const maxAge = Number(timeHours) * 3600;
   return nowSec() - blockTime > maxAge;
 }
 
