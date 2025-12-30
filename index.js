@@ -200,22 +200,50 @@ async function getSolBalance(wallet) {
 function lamportsToSol(l) {
   return l / 1_000_000_000;
 }
+
+// ================== FIXED TRANSFER PARSER (HELIOUS SAFE) ==================
+const SYSTEM_PROGRAM_ID = "11111111111111111111111111111111";
+
+function getProgramIdString(ix) {
+  if (!ix) return null;
+  if (typeof ix.programId === "string") return ix.programId;
+  if (ix.programId && typeof ix.programId.toString === "function") return ix.programId.toString();
+  // đôi lúc jsonParsed không có programId, nhưng có program === "system"
+  return null;
+}
+
+function isSystemTransferIx(ix) {
+  if (!ix?.parsed || ix?.parsed?.type !== "transfer") return false;
+
+  const program = ix.program; // "system" đôi lúc có, đôi lúc không
+  const pid = getProgramIdString(ix);
+
+  return program === "system" || pid === SYSTEM_PROGRAM_ID;
+}
+
 function extractSystemTransfers(tx) {
   const out = [];
   if (!tx) return out;
 
+  const pushIx = (ix) => {
+    if (!isSystemTransferIx(ix)) return;
+    const info = ix.parsed?.info || {};
+    out.push({
+      from: info.source,
+      to: info.destination,
+      lamports: Number(info.lamports || 0),
+    });
+  };
+
+  // outer instructions
   for (const ix of tx?.transaction?.message?.instructions || []) {
-    if (ix?.program === "system" && ix?.parsed?.type === "transfer") {
-      const info = ix.parsed.info;
-      out.push({ from: info.source, to: info.destination, lamports: Number(info.lamports || 0) });
-    }
+    pushIx(ix);
   }
+
+  // inner instructions
   for (const group of tx?.meta?.innerInstructions || []) {
     for (const ix of group?.instructions || []) {
-      if (ix?.program === "system" && ix?.parsed?.type === "transfer") {
-        const info = ix.parsed.info;
-        out.push({ from: info.source, to: info.destination, lamports: Number(info.lamports || 0) });
-      }
+      pushIx(ix);
     }
   }
 
@@ -249,7 +277,9 @@ function pickTxtAttachment(msg) {
 async function downloadAttachmentText(att) {
   const size = Number(att.size || 0);
   if (size > MAX_TXT_BYTES) {
-    throw new Error(`File quá lớn (${Math.round(size / 1024)}KB). Max ~${Math.round(MAX_TXT_BYTES / 1024)}KB.`);
+    throw new Error(
+      `File quá lớn (${Math.round(size / 1024)}KB). Max ~${Math.round(MAX_TXT_BYTES / 1024)}KB.`
+    );
   }
 
   const url = att.url;
@@ -280,6 +310,7 @@ async function scanWalletWithSource(wallet, sourceWallet, minSol, timeHours) {
   const sigs = await getSignatures(wallet, SIG_FETCH_LIMIT);
   if (!Array.isArray(sigs) || sigs.length === 0) return null;
 
+  // ✅ giữ nguyên đúng yêu cầu: lấy 2 tx CŨ NHẤT
   const oldestTwo = sigs.slice(-2);
 
   const txs = await Promise.all(
@@ -450,7 +481,7 @@ client.on("interactionCreate", async (interaction) => {
       const presets = getAllPresets();
       const keys = Object.keys(presets).sort();
 
-      // filter: startsWith (mượt)
+      // filter: startsWith
       const results = keys
         .filter((k) => k.startsWith(q))
         .slice(0, 25)
@@ -758,6 +789,7 @@ client.on("messageCreate", async (msg) => {
     console.log(`🧩 Config scope: PER CHANNEL`);
     console.log(`📎 scanlist: supports .txt attachment`);
     console.log(`✨ autocomplete: /source wallet:<presetName>`);
+    console.log(`🛠 parser: supports system transfer via programId`);
   });
 
   await client.login(process.env.DISCORD_BOT_TOKEN);
