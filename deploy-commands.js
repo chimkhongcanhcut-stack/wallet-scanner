@@ -1,134 +1,134 @@
 require("dotenv").config();
 const { REST, Routes, SlashCommandBuilder } = require("discord.js");
 
-function cmd(builder) {
-  // Chặn DM để khỏi "The application did not respond" khi gọi trong DM
-  return builder.setDMPermission(false);
-}
+const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
+const CLIENT_ID = process.env.CLIENT_ID;     // bắt buộc
+const GUILD_ID = process.env.GUILD_ID || ""; // optional (nếu muốn guild commands nhanh)
 
-const commands = [
-  // ================== /source ==================
-  cmd(
-    new SlashCommandBuilder()
-      .setName("source")
-      .setDescription("Set source wallet cho channel này (pubkey hoặc preset name)")
-      .addStringOption((opt) =>
-        opt
-          .setName("wallet")
-          .setDescription('Nhập pubkey hoặc preset name (vd: "kucoin")')
-          .setAutocomplete(true) // ✅ AUTOCOMPLETE ON
-          .setRequired(true)
-      )
-  ),
+if (!DISCORD_BOT_TOKEN) throw new Error("Missing DISCORD_BOT_TOKEN in .env");
+if (!CLIENT_ID) throw new Error("Missing CLIENT_ID in .env");
 
-  // ================== /preset ==================
-  cmd(
-    new SlashCommandBuilder()
-      .setName("preset")
-      .setDescription("Quản lý preset source")
-      .addSubcommand((sc) =>
-        sc
-          .setName("add")
-          .setDescription("Thêm preset mới")
-          .addStringOption((opt) =>
-            opt
-              .setName("name")
-              .setDescription('Tên preset (vd: "kucoin", "binance", "mexc")')
-              .setRequired(true)
-          )
-          .addStringOption((opt) =>
-            opt
-              .setName("wallet")
-              .setDescription("Pubkey Solana cho preset")
-              .setRequired(true)
-          )
-      )
-      .addSubcommand((sc) =>
-        sc
-          .setName("del")
-          .setDescription("Xoá preset")
-          .addStringOption((opt) =>
-            opt
-              .setName("name")
-              .setDescription('Tên preset cần xoá (vd: "mexc")')
-              .setRequired(true)
-          )
-      )
-      .addSubcommand((sc) => sc.setName("list").setDescription("Xem danh sách preset"))
-  ),
+const commands = [];
 
-  // ================== /time ==================
-  cmd(
-    new SlashCommandBuilder()
-      .setName("time")
-      .setDescription("Set thời gian tối đa (giờ) cho 2 tx cũ nhất (channel này)")
-      .addNumberOption((opt) =>
-        opt
-          .setName("hours")
-          .setDescription("Số giờ, ví dụ 48 / 168")
-          .setRequired(true)
-          .setMinValue(1)
-          .setMaxValue(168) // ✅ 168 giờ
-      )
-  ),
+// /show
+commands.push(
+  new SlashCommandBuilder().setName("show").setDescription("Show config của channel hiện tại")
+);
 
-  // ================== /show ==================
-  cmd(new SlashCommandBuilder().setName("show").setDescription("Xem cấu hình hiện tại (source/time) của channel này")),
+// /source (autocomplete ở bot runtime)
+commands.push(
+  new SlashCommandBuilder()
+    .setName("source")
+    .setDescription("Set source wallet (pubkey hoặc preset)")
+    .addStringOption((o) =>
+      o
+        .setName("wallet")
+        .setDescription("Pubkey hoặc preset name (ví dụ: kucoin)")
+        .setRequired(true)
+        .setAutocomplete(true)
+    )
+);
 
-  // ================== /scan ==================
-  cmd(
-    new SlashCommandBuilder()
-      .setName("scan")
-      .setDescription("Scan 1 Solana wallet theo điều kiện (channel config)")
-      .addStringOption((opt) =>
-        opt
-          .setName("wallet")
-          .setDescription('Wallet cần scan, ví dụ: "9BKT..."')
-          .setRequired(true)
-      )
-  ),
+// /min
+commands.push(
+  new SlashCommandBuilder()
+    .setName("min")
+    .setDescription("Set min SOL từ source")
+    .addNumberOption((o) =>
+      o.setName("sol").setDescription("Min SOL (ví dụ 50)").setRequired(true)
+    )
+);
 
-  // ================== /scanlist ==================
-  cmd(
-    new SlashCommandBuilder()
-      .setName("scanlist")
-      .setDescription("Scan nhiều ví: bot sẽ chờ bạn paste list hoặc upload .txt")
-  ),
-].map((c) => c.toJSON());
+// /time
+commands.push(
+  new SlashCommandBuilder()
+    .setName("time")
+    .setDescription("Set time window (giờ) - oldest signature phải nằm trong window")
+    .addNumberOption((o) =>
+      o.setName("hours").setDescription("Hours (1 -> 168)").setRequired(true)
+    )
+);
 
-const token = process.env.DISCORD_BOT_TOKEN;
-const clientId = process.env.CLIENT_ID;
-const guildId = process.env.GUILD_ID;
+// /scan
+commands.push(
+  new SlashCommandBuilder()
+    .setName("scan")
+    .setDescription("Scan 1 wallet theo config channel")
+    .addStringOption((o) =>
+      o.setName("wallet").setDescription("Target wallet pubkey").setRequired(true)
+    )
+);
 
-if (!token) {
-  console.error("❌ DISCORD_BOT_TOKEN missing in .env");
-  process.exit(1);
-}
-if (!clientId) {
-  console.error("❌ CLIENT_ID missing in .env");
-  process.exit(1);
-}
-if (!guildId) {
-  console.error("❌ GUILD_ID missing in .env");
-  process.exit(1);
-}
+// /scanlist
+commands.push(
+  new SlashCommandBuilder()
+    .setName("scanlist")
+    .setDescription("Scan list wallets (paste hoặc upload .txt trong 60s)")
+);
 
-const rest = new REST({ version: "10" }).setToken(token);
+// /preset add/del/list
+const preset = new SlashCommandBuilder().setName("preset").setDescription("Manage source presets");
+
+preset.addSubcommand((s) =>
+  s
+    .setName("add")
+    .setDescription("Add preset name -> wallet")
+    .addStringOption((o) => o.setName("name").setDescription("preset name (a-z0-9_.-)").setRequired(true))
+    .addStringOption((o) => o.setName("wallet").setDescription("source wallet pubkey").setRequired(true))
+);
+
+preset.addSubcommand((s) =>
+  s
+    .setName("del")
+    .setDescription("Delete user preset (default preset không xoá được)")
+    .addStringOption((o) => o.setName("name").setDescription("preset name").setRequired(true))
+);
+
+preset.addSubcommand((s) => s.setName("list").setDescription("List tất cả preset"));
+
+commands.push(preset);
+
+// /cacheclear
+commands.push(
+  new SlashCommandBuilder()
+    .setName("cacheclear")
+    .setDescription("Clear cache oldestSig (để scan lại fresh)")
+    .addStringOption((o) =>
+      o
+        .setName("mode")
+        .setDescription("channel: xoá cache theo list wallet | all: xoá hết")
+        .setRequired(true)
+        .addChoices(
+          { name: "channel", value: "channel" },
+          { name: "all", value: "all" }
+        )
+    )
+    .addStringOption((o) =>
+      o
+        .setName("wallets")
+        .setDescription("Chỉ dùng cho mode=channel: paste nhiều wallet (mỗi dòng 1 ví)")
+        .setRequired(false)
+    )
+);
 
 (async () => {
+  const rest = new REST({ version: "10" }).setToken(DISCORD_BOT_TOKEN);
+
+  const body = commands.map((c) => c.toJSON());
+
   try {
-    console.log("📌 Registering guild commands…");
-    console.log("   CLIENT_ID:", clientId);
-    console.log("   GUILD_ID :", guildId);
+    console.log(`🚀 Deploying ${body.length} commands...`);
 
-    await rest.put(Routes.applicationGuildCommands(clientId, guildId), {
-      body: commands,
-    });
-
-    console.log("✅ Registered: /source (autocomplete) /preset /time(168h) /show /scan /scanlist");
-    console.log("ℹ️ Nếu command cũ (/min) vẫn còn hiện, chờ 1-2 phút hoặc restart Discord.");
+    if (GUILD_ID) {
+      await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body });
+      console.log("✅ Deployed to GUILD (instant).");
+    } else {
+      await rest.put(Routes.applicationCommands(CLIENT_ID), { body });
+      console.log("✅ Deployed GLOBAL (can take some minutes).");
+    }
   } catch (e) {
-    console.error("❌ Register failed:", e?.message || e);
+    console.error("❌ Deploy failed:", e?.message || e);
+    if (e?.rawError) console.error("Raw:", e.rawError);
     process.exit(1);
   }
 })();
