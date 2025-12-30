@@ -16,39 +16,42 @@ const {
 // ================== CONFIG ==================
 const RPC_URL = process.env.RPC_URL;
 
+const DEFAULT_MIN_SOL = 50;
 const DEFAULT_TIME_HOURS = 5;
 
-const SIG_FETCH_LIMIT = 120;
-const CONCURRENCY = 6;
+const CONCURRENCY = 2; // scan nhẹ để đỡ rate
 const REQUEST_TIMEOUT_MS = 20_000;
 
 const STATE_FILE = path.join(__dirname, "state.json");
 const DEFAULT_SOURCE = "";
 
+// One-shot signatures fetch (no paginate)
+const SIG_PAGE_LIMIT = 1000; // max getSignaturesForAddress
+
 // txt attachment limits
 const MAX_TXT_BYTES = 1_000_000; // 1MB
 
 // ================== STATE (PER-CHANNEL) ==================
-// ✅ removed mins
-let state = { sources: {}, times: {}, presets: {} };
+let state = { sources: {}, mins: {}, times: {}, presets: {}, oldestSigs: {} };
 
 function loadState() {
   try {
     if (fs.existsSync(STATE_FILE)) {
       state = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-      if (!state || typeof state !== "object") state = { sources: {}, times: {}, presets: {} };
+      if (!state || typeof state !== "object")
+        state = { sources: {}, mins: {}, times: {}, presets: {}, oldestSigs: {} };
 
       if (!state.sources || typeof state.sources !== "object") state.sources = {};
+      if (!state.mins || typeof state.mins !== "object") state.mins = {};
       if (!state.times || typeof state.times !== "object") state.times = {};
       if (!state.presets || typeof state.presets !== "object") state.presets = {};
-
-      // backward compat: xoá mins nếu file cũ còn
-      if (state.mins) delete state.mins;
+      if (!state.oldestSigs || typeof state.oldestSigs !== "object") state.oldestSigs = {};
     }
   } catch {
-    state = { sources: {}, times: {}, presets: {} };
+    state = { sources: {}, mins: {}, times: {}, presets: {}, oldestSigs: {} };
   }
 }
+
 function saveState() {
   try {
     fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), "utf8");
@@ -56,6 +59,7 @@ function saveState() {
     console.log("⚠️ Cannot save state.json:", e.message);
   }
 }
+
 function scopeKey(guildId, channelId) {
   return `${guildId}:${channelId}`;
 }
@@ -65,6 +69,15 @@ function getSourceForChannel(guildId, channelId) {
 }
 function setSourceForChannel(guildId, channelId, source) {
   state.sources[scopeKey(guildId, channelId)] = source;
+  saveState();
+}
+
+function getMinForChannel(guildId, channelId) {
+  const v = state.mins[scopeKey(guildId, channelId)];
+  return typeof v === "number" && Number.isFinite(v) ? v : DEFAULT_MIN_SOL;
+}
+function setMinForChannel(guildId, channelId, minSol) {
+  state.mins[scopeKey(guildId, channelId)] = minSol;
   saveState();
 }
 
@@ -82,6 +95,37 @@ function looksLikeSolPubkey(s) {
   const t = s.trim();
   if (t.length < 32 || t.length > 50) return false;
   return /^[1-9A-HJ-NP-Za-km-z]+$/.test(t);
+}
+
+// ================== OLDEST SIG CACHE ==================
+// state.oldestSigs[wallet] = { sig, blockTime } OR { marker: "TOO_MANY_TX"|"TOO_OLD"|"NO_HISTORY", blockTime?, sig? }
+function getCachedOldest(wallet) {
+  const v = state.oldestSigs?.[wallet];
+  if (!v || typeof v !== "object") return null;
+  if (v.marker && typeof v.marker === "string") return v;
+  if (v.sig && typeof v.sig === "string") return v;
+  return null;
+}
+function setCachedOldest(wallet, obj) {
+  if (!state.oldestSigs || typeof state.oldestSigs !== "object") state.oldestSigs = {};
+  state.oldestSigs[wallet] = obj;
+  saveState();
+}
+function clearOldestCacheAll() {
+  state.oldestSigs = {};
+  saveState();
+}
+function clearOldestCacheWallets(wallets) {
+  if (!state.oldestSigs || typeof state.oldestSigs !== "object") state.oldestSigs = {};
+  let removed = 0;
+  for (const w of wallets) {
+    if (state.oldestSigs[w]) {
+      delete state.oldestSigs[w];
+      removed++;
+    }
+  }
+  saveState();
+  return removed;
 }
 
 // ================== PRESET (DEFAULT + USER) ==================
@@ -109,7 +153,6 @@ function setPreset(name, wallet) {
   saveState();
 }
 function delPreset(name) {
-  // chỉ xoá user preset; default preset không xoá được
   if (!state.presets || typeof state.presets !== "object") state.presets = {};
   if (state.presets[name]) {
     delete state.presets[name];
@@ -147,25 +190,61 @@ function shortPk(pk) {
   if (!pk || pk.length < 12) return pk || "";
   return `${pk.slice(0, 4)}…${pk.slice(-4)}`;
 }
+function nowSec() {
+  return Math.floor(Date.now() / 1000);
+}
+function isOlderThanWindow(blockTime, timeHours) {
+  if (!blockTime || !Number.isFinite(blockTime)) return false; // unknown => can't skip
+  const maxAge = Math.floor(Number(timeHours) * 3600);
+  return nowSec() - blockTime > maxAge;
+}
+
+// ================== RATE LIMIT ERROR ==================
+class RateLimitError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "RateLimitError";
+    this.isRateLimit = true;
+  }
+}
+function isRateLimitMessage(msg) {
+  const m = String(msg || "").toLowerCase();
+  return m.includes("rate limit") || m.includes("too many requests") || m.includes("429");
+}
 
 // ================== RPC HELPERS ==================
+let RPC_ID = 1;
+
 async function rpc(method, params) {
   const res = await axios.post(
     RPC_URL,
-    { jsonrpc: "2.0", id: 1, method, params },
+    { jsonrpc: "2.0", id: RPC_ID++, method, params },
     {
       timeout: REQUEST_TIMEOUT_MS,
       headers: { "Content-Type": "application/json" },
       validateStatus: () => true,
     }
   );
+
+  // HTTP rate limit
+  if (res.status === 429) throw new RateLimitError(`Rate limited (HTTP 429) on ${method}`);
+
+  // Some providers return 200 but error.message contains rate limit
+  if (res.data?.error?.message && isRateLimitMessage(res.data.error.message)) {
+    throw new RateLimitError(`Rate limited on ${method}: ${res.data.error.message}`);
+  }
+
   if (!res.data) throw new Error(`RPC empty response for ${method}`);
   if (res.data.error) throw new Error(res.data.error.message || "RPC error");
   return res.data.result;
 }
-async function getSignatures(address, limit = 50) {
-  return rpc("getSignaturesForAddress", [address, { limit }]);
+
+async function getSignatures(address, limit = 50, before = null) {
+  const cfg = { limit };
+  if (before) cfg.before = before;
+  return rpc("getSignaturesForAddress", [address, cfg]);
 }
+
 async function getTx(signature) {
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
@@ -174,19 +253,23 @@ async function getTx(signature) {
         { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 },
       ]);
     } catch (e) {
+      if (e?.isRateLimit) throw e;
       if (attempt === 2) throw e;
       await new Promise((r) => setTimeout(r, 350));
     }
   }
   return null;
 }
+
 async function getSolBalance(wallet) {
   const res = await rpc("getBalance", [wallet, { commitment: "confirmed" }]);
   return Number(res?.value || 0) / 1e9;
 }
+
 function lamportsToSol(l) {
   return l / 1_000_000_000;
 }
+
 function extractSystemTransfers(tx) {
   const out = [];
   if (!tx) return out;
@@ -205,39 +288,48 @@ function extractSystemTransfers(tx) {
       }
     }
   }
-
   return out;
 }
 
-// ================== INITIAL BALANCE CHECK ==================
-function getWalletPrePostLamports(tx, wallet) {
-  try {
-    const keys = tx?.transaction?.message?.accountKeys || [];
-    const pickPubkey = (k) => (typeof k === "string" ? k : k?.pubkey);
-
-    const idx = keys.findIndex((k) => pickPubkey(k) === wallet);
-    if (idx < 0) return { idx: -1, pre: null, post: null };
-
-    const pre = tx?.meta?.preBalances?.[idx];
-    const post = tx?.meta?.postBalances?.[idx];
-    return {
-      idx,
-      pre: typeof pre === "number" ? pre : null,
-      post: typeof post === "number" ? post : null,
-    };
-  } catch {
-    return { idx: -1, pre: null, post: null };
+// ================== OPTIMIZED: FIND OLDEST (ONE CALL) + CACHE + TIME WINDOW SKIP ==================
+async function findOldestCached(address, timeHours) {
+  const cached = getCachedOldest(address);
+  if (cached) {
+    // if cached sig has blockTime and now too old -> convert to TOO_OLD
+    if (cached.sig && cached.blockTime && isOlderThanWindow(cached.blockTime, timeHours)) {
+      const obj = { marker: "TOO_OLD", blockTime: cached.blockTime, sig: cached.sig };
+      setCachedOldest(address, obj);
+      return obj;
+    }
+    return cached;
   }
-}
-function getFeePayer(tx) {
-  try {
-    const keys = tx?.transaction?.message?.accountKeys || [];
-    if (!keys.length) return null;
-    const k0 = keys[0];
-    return typeof k0 === "string" ? k0 : k0?.pubkey || null;
-  } catch {
-    return null;
+
+  const first = await getSignatures(address, SIG_PAGE_LIMIT, null);
+  if (!Array.isArray(first) || first.length === 0) {
+    const obj = { marker: "NO_HISTORY" };
+    setCachedOldest(address, obj);
+    return obj;
   }
+
+  if (first.length === SIG_PAGE_LIMIT) {
+    const obj = { marker: "TOO_MANY_TX" };
+    setCachedOldest(address, obj);
+    return obj;
+  }
+
+  const last = first[first.length - 1];
+  const sig = last?.signature || null;
+  const bt = Number.isFinite(last?.blockTime) ? last.blockTime : null;
+
+  if (bt && isOlderThanWindow(bt, timeHours)) {
+    const obj = { marker: "TOO_OLD", blockTime: bt, sig };
+    setCachedOldest(address, obj);
+    return obj;
+  }
+
+  const obj = { sig, blockTime: bt };
+  setCachedOldest(address, obj);
+  return obj;
 }
 
 // ================== INPUT PARSE ==================
@@ -271,7 +363,6 @@ async function downloadAttachmentText(att) {
       `File quá lớn (${Math.round(size / 1024)}KB). Max ~${Math.round(MAX_TXT_BYTES / 1024)}KB.`
     );
   }
-
   const url = att.url;
   const res = await axios.get(url, { responseType: "text", timeout: REQUEST_TIMEOUT_MS });
   if (typeof res.data !== "string") throw new Error("Không đọc được nội dung file text.");
@@ -279,96 +370,117 @@ async function downloadAttachmentText(att) {
 }
 
 // ================== CONCURRENCY ==================
-async function mapLimit(arr, limit, fn) {
+async function mapLimit(arr, limit, fn, shouldStop) {
   const ret = new Array(arr.length);
   let i = 0;
   const workers = Array.from({ length: Math.min(limit, arr.length) }, () =>
     (async () => {
       while (true) {
+        if (shouldStop && shouldStop()) break;
         const idx = i++;
         if (idx >= arr.length) break;
+        if (shouldStop && shouldStop()) break;
         ret[idx] = await fn(arr[idx], idx);
       }
     })()
   );
-  await Promise.all(workers);
+  await Promise.allSettled(workers);
   return ret;
 }
 
 // ================== SCAN LOGIC ==================
-// ✅ Removed: "2 tx cũ nhất" / white-ish oldest logic
-// ✅ Rule: within time window, funding tx where (from==source OR feePayer==source) AND to==wallet AND preBalance(wallet)==0
-async function scanWalletWithSource(wallet, sourceWallet, timeHours) {
-  const sigs = await getSignatures(wallet, SIG_FETCH_LIMIT);
-  if (!Array.isArray(sigs) || sigs.length === 0) return null;
+async function scanWalletWithSource(wallet, sourceWallet, minSol, timeHours) {
+  const info = await findOldestCached(wallet, timeHours);
 
-  const nowSec = Math.floor(Date.now() / 1000);
-  const maxAgeSec = Math.floor(timeHours * 3600);
-
-  for (const s of sigs) {
-    const sig = s.signature;
-    if (!sig) continue;
-
-    // quick filter using signature blockTime if present
-    if (s.blockTime && nowSec - s.blockTime > maxAgeSec) continue;
-
-    let tx;
-    try {
-      tx = await getTx(sig);
-    } catch {
-      continue;
-    }
-    if (!tx?.blockTime) continue;
-    if (nowSec - tx.blockTime > maxAgeSec) continue;
-
-    const transfers = extractSystemTransfers(tx);
-    if (!transfers.length) continue;
-
-    // initial balance = 0
-    const pp = getWalletPrePostLamports(tx, wallet);
-    const preOk = pp.pre === 0;
-    const fallbackOk = pp.pre === null && typeof pp.post === "number" && pp.post > 0;
-    if (!preOk && !fallbackOk) continue;
-
-    const feePayer = getFeePayer(tx);
-
-    for (const tr of transfers) {
-      if (tr.to !== wallet) continue;
-
-      const sourceOk = tr.from === sourceWallet || feePayer === sourceWallet;
-      if (!sourceOk) continue;
-
-      const balance = await getSolBalance(wallet);
-
-      return {
-        wallet,
-        balance,
-        source: sourceWallet,
-        fundedSol: lamportsToSol(tr.lamports),
-        sig,
-        fundingTime: formatTime(tx.blockTime),
-        scannedAt: scanNowStr(),
-        txCondition: "Funding trong time window + initial balance = 0",
-        timeRule: `${timeHours} giờ`,
-      };
-    }
+  if (info.marker === "NO_HISTORY") {
+    console.log(`[WHITE] ${wallet} -> NO HISTORY`);
+    return null;
+  }
+  if (info.marker === "TOO_MANY_TX") {
+    console.log(`[WHITE] ${wallet} -> SKIP (too many tx, first page=1000)`);
+    return null;
+  }
+  if (info.marker === "TOO_OLD") {
+    console.log(
+      `[WHITE] ${wallet} -> SKIP (oldest too old) bt=${info.blockTime || "N/A"} window=${timeHours}h sig=${info.sig || "-"}`
+    );
+    return null;
   }
 
+  const oldestSig = info.sig;
+  if (!oldestSig) {
+    console.log(`[WHITE] ${wallet} -> NO OLDEST SIG`);
+    return null;
+  }
+
+  const tx = await getTx(oldestSig);
+  const blockTime = tx?.blockTime || info.blockTime || null;
+
+  // time window check again (covers signature blockTime null)
+  if (blockTime && isOlderThanWindow(blockTime, timeHours)) {
+    console.log(`[WHITE] ${wallet} -> SKIP (oldest too old after tx) bt=${blockTime} window=${timeHours}h`);
+    setCachedOldest(wallet, { marker: "TOO_OLD", blockTime, sig: oldestSig });
+    return null;
+  }
+
+  const transfers = extractSystemTransfers(tx);
+
+  for (const tr of transfers) {
+    if (tr.from !== sourceWallet) continue;
+    if (tr.to !== wallet) continue;
+
+    const sol = lamportsToSol(tr.lamports);
+    if (sol < minSol) continue;
+
+    const balance = await getSolBalance(wallet);
+
+    console.log(
+      `[WHITE] ✅ MATCH wallet=${wallet} oldestSig=${oldestSig} time=${blockTime} amount=${sol.toFixed(4)} SOL`
+    );
+
+    setCachedOldest(wallet, { sig: oldestSig, blockTime });
+
+    return {
+      wallet,
+      balance,
+      source: sourceWallet,
+      fundedSol: sol,
+      sig: oldestSig,
+      fundingTime: formatTime(blockTime),
+      scannedAt: scanNowStr(),
+      txCondition: "TX CŨ NHẤT là funding từ Source",
+      timeRule: `${timeHours} giờ`,
+    };
+  }
+
+  console.log(`[WHITE] ❌ NOT wallet=${wallet} oldestSig=${oldestSig} time=${blockTime}`);
+  setCachedOldest(wallet, { sig: oldestSig, blockTime });
   return null;
 }
 
 // ================== PRETTY OUTPUT ==================
-function makeSummaryEmbed({ source, timeHours, scannedCount, hitCount, channelId }) {
+function makeSummaryEmbed({ source, minSol, timeHours, scannedCount, hitCount, channelId, stoppedReason }) {
+  const color = stoppedReason ? 0xe67e22 : hitCount > 0 ? 0x2ecc71 : 0x95a5a6;
+  const title = stoppedReason
+    ? "⛔ Scan Stopped (Rate Limit)"
+    : "🔎 Scan Result (Oldest TX + Time Window + Cache)";
+
+  const extra = stoppedReason
+    ? `\n\n⚠️ **Stopped:** ${stoppedReason}\n👉 Hãy giảm list / đợi vài phút / đổi RPC xịn hơn.`
+    : "";
+
   return new EmbedBuilder()
-    .setTitle("🔎 Scan Result (Channel Config)")
-    .setColor(hitCount > 0 ? 0x2ecc71 : 0x95a5a6)
+    .setTitle(title)
+    .setColor(color)
     .setDescription(
       `**Channel:** <#${channelId}>\n` +
         `**Source:** ${source ? `[${shortPk(source)}](${solscanTransfersUrl(source)})` : "*chưa set*"}\n` +
-        `**Rule:** **initial balance = 0**\n` +
-        `**Time window:** **${timeHours} giờ** (within window)\n` +
+        `**Min amount:** **${minSol} SOL**\n` +
+        `**Time window:** **${timeHours} giờ**\n` +
+        `**Rule:** TX cũ nhất phải là funding từ Source\n` +
         `**Scanned:** **${scannedCount}** • **Matched:** **${hitCount}**\n` +
-        `**Scan time:** **${scanNowStr()}**`
+        `**Scan time:** **${scanNowStr()}**` +
+        extra
     )
     .setTimestamp(new Date());
 }
@@ -384,15 +496,15 @@ function makeWalletEmbed(hit) {
     .setDescription(
       `**Wallet:** [${hit.wallet}](${transfersLink})\n` +
         `**Balance:** **${Number(hit.balance || 0).toFixed(3)} SOL**\n\n` +
-        `**Tx:** **${hit.txCondition}**\n` +
-        `**Funding time:** **${hit.fundingTime}**\n` +
-        `**Scanned at:** **${hit.scannedAt}**\n` +
-        `**Time rule:** **${hit.timeRule}**\n\n` +
+        `**Rule:** **${hit.txCondition}**\n` +
+        `**Oldest TX time:** **${hit.fundingTime}**\n` +
+        `**Time window:** **${hit.timeRule}**\n` +
+        `**Scanned at:** **${hit.scannedAt}**\n\n` +
         `**Source:** [${shortPk(hit.source)}](${solscanTransfersUrl(hit.source)})\n` +
         `**Amount from source:** **${hit.fundedSol.toFixed(3)} SOL**\n` +
         `**TX:** [Open on Solscan](${txLink})`
     )
-    .setFooter({ text: "Solana Funding Scanner" })
+    .setFooter({ text: "Solana White Funding Scanner (Oldest + Time Window + Cache)" })
     .setTimestamp(new Date());
 }
 
@@ -403,30 +515,67 @@ function makeWalletButtons(hit) {
   );
 }
 
-async function runScanAndRespond(target, wallets, source, timeHours, channelId) {
-  const results = await mapLimit(wallets, CONCURRENCY, async (w) => {
-    try {
-      return await scanWalletWithSource(w, source, timeHours);
-    } catch {
-      return null;
-    }
-  });
+async function sendStoppedMessage(target, reason) {
+  const msg = `⚠️ **Rate limit hit** → bot đã **dừng scan**.\n**Reason:** ${reason}`;
+  try {
+    if ("followUp" in target) return await target.followUp({ content: msg });
+    if ("channel" in target && target.channel) return await target.channel.send({ content: msg });
+    if ("reply" in target) return await target.reply({ content: msg });
+  } catch {}
+}
 
-  const hits = results.filter(Boolean);
+async function runScanAndRespond(target, wallets, source, minSol, timeHours, channelId) {
+  let stoppedReason = "";
+  let scannedSoFar = 0;
+
+  const shouldStop = () => Boolean(stoppedReason);
+
+  const results = await mapLimit(
+    wallets,
+    CONCURRENCY,
+    async (w) => {
+      if (shouldStop()) return null;
+      scannedSoFar++;
+
+      try {
+        return await scanWalletWithSource(w, source, minSol, timeHours);
+      } catch (e) {
+        if (e?.isRateLimit || e?.name === "RateLimitError") {
+          stoppedReason = e.message || "Rate limit";
+          console.log(`[WHITE] ⛔ STOP: ${stoppedReason}`);
+          return null;
+        }
+        console.log(`[WHITE] ⚠️ ERROR wallet=${w}: ${e.message}`);
+        return null;
+      }
+    },
+    shouldStop
+  );
+
+  const hits = (results || []).filter(Boolean);
   hits.sort((a, b) => b.fundedSol - a.fundedSol || b.balance - a.balance);
 
   const summary = makeSummaryEmbed({
     source,
+    minSol,
     timeHours,
-    scannedCount: wallets.length,
+    scannedCount: stoppedReason ? scannedSoFar : wallets.length,
     hitCount: hits.length,
     channelId,
+    stoppedReason: stoppedReason || "",
   });
 
+  // send summary
   if ("editReply" in target) {
     await target.editReply({ content: hits.length > 0 ? "@everyone" : "", embeds: [summary] });
   } else {
     await target.reply({ content: hits.length > 0 ? "@everyone" : "", embeds: [summary] });
+  }
+
+  // if stopped => notify explicitly
+  if (stoppedReason) {
+    await sendStoppedMessage(target, stoppedReason);
+    return;
   }
 
   if (hits.length === 0) return;
@@ -456,11 +605,11 @@ function waitKey(guildId, userId, channelId) {
 // ================== INTERACTIONS ==================
 client.on("interactionCreate", async (interaction) => {
   try {
-    // ================== AUTOCOMPLETE (/source wallet) ==================
+    // AUTOCOMPLETE (/source wallet)
     if (interaction.isAutocomplete()) {
       if (interaction.commandName !== "source") return;
 
-      const focused = interaction.options.getFocused(true); // { name, value }
+      const focused = interaction.options.getFocused(true);
       if (!focused || focused.name !== "wallet") return;
 
       const q = String(focused.value || "").toLowerCase();
@@ -478,7 +627,6 @@ client.on("interactionCreate", async (interaction) => {
       return interaction.respond(results);
     }
 
-    // ================== COMMANDS ==================
     if (!interaction.isChatInputCommand()) return;
 
     const guildId = interaction.guildId;
@@ -490,6 +638,7 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.deferReply();
 
       const source = getSourceForChannel(guildId, channelId);
+      const minSol = getMinForChannel(guildId, channelId);
       const timeHours = getTimeForChannel(guildId, channelId);
 
       const e = new EmbedBuilder()
@@ -498,17 +647,17 @@ client.on("interactionCreate", async (interaction) => {
         .setDescription(
           `**Channel:** <#${channelId}>\n` +
             `**Source:** ${source ? `[${source}](${solscanTransfersUrl(source)})` : "*chưa set*"}\n` +
-            `**Rule:** **initial balance = 0**\n` +
-            `**Time window:** **${timeHours} giờ**\n\n` +
+            `**Min SOL:** **${minSol}**\n` +
+            `**Time window:** **${timeHours} giờ**\n` +
+            `**Rule:** TX cũ nhất phải là funding từ Source\n\n` +
             `Dùng:\n` +
-            `- \`/source wallet:<pubkey>\` (như cũ)\n` +
-            `- \`/source wallet:<presetName>\` (mới)\n` +
-            `- \`/preset add name:<name> wallet:<pubkey>\`\n` +
-            `- \`/preset del name:<name>\`\n` +
-            `- \`/preset list\`\n` +
-            `- \`/time hours:5\` (1 → 168)\n` +
-            `- \`/scan wallet:<pubkey>\`\n` +
-            `- \`/scanlist\` rồi paste/upload .txt`
+            `- \`/source wallet:<pubkey>\` hoặc \`/source wallet:<presetName>\`\n` +
+            `- \`/preset add/del/list\`\n` +
+            `- \`/min sol:50\`\n` +
+            `- \`/time hours:5\`\n` +
+            `- \`/scan wallet:<wallet>\`\n` +
+            `- \`/scanlist\`\n` +
+            `- \`/cacheclear\``
         )
         .setTimestamp(new Date());
 
@@ -518,7 +667,6 @@ client.on("interactionCreate", async (interaction) => {
     // /preset
     if (interaction.commandName === "preset") {
       await interaction.deferReply();
-
       const sub = interaction.options.getSubcommand();
 
       if (sub === "add") {
@@ -583,25 +731,21 @@ client.on("interactionCreate", async (interaction) => {
       const raw = interaction.options.getString("wallet");
       const input = String(raw || "").trim().replace(/^"+|"+$/g, "");
 
-      // Try preset
       const name = normalizePresetName(input);
       const presetWallet = getPreset(name);
 
       let source = presetWallet || input;
 
-      // If not preset, must be pubkey
       if (!presetWallet && !looksLikeSolPubkey(source)) {
         return interaction.editReply(
           "❌ Source không hợp lệ.\n" +
-            "Bạn có thể:\n" +
-            `- Nhập pubkey: \`/source wallet:5tzF...\`\n` +
-            `- Hoặc preset name: \`/source wallet:kucoin\` (gõ ku sẽ có suggestion)\n` +
-            `- Quản lý preset: \`/preset add/del/list\``
+            `- Pubkey: \`/source wallet:5tzF...\`\n` +
+            `- Preset: \`/source wallet:kucoin\`\n` +
+            `- Quản lý: \`/preset add/del/list\``
         );
       }
 
       setSourceForChannel(guildId, channelId, source);
-
       const hint = presetWallet ? ` (preset: **${name}**)` : "";
 
       const e = new EmbedBuilder()
@@ -612,6 +756,24 @@ client.on("interactionCreate", async (interaction) => {
             `Source:${hint}\n` +
             `**${source}**\n\nLink: ${solscanTransfersUrl(source)}`
         )
+        .setTimestamp(new Date());
+
+      return interaction.editReply({ embeds: [e] });
+    }
+
+    // /min
+    if (interaction.commandName === "min") {
+      await interaction.deferReply();
+
+      const v = Number(interaction.options.getNumber("sol"));
+      if (!Number.isFinite(v) || v < 0) return interaction.editReply("❌ Min SOL không hợp lệ.");
+
+      setMinForChannel(guildId, channelId, v);
+
+      const e = new EmbedBuilder()
+        .setTitle("✅ Min Updated (This Channel)")
+        .setColor(0x9b59b6)
+        .setDescription(`**Channel:** <#${channelId}>\nMin SOL: **${v} SOL**`)
         .setTimestamp(new Date());
 
       return interaction.editReply({ embeds: [e] });
@@ -637,21 +799,49 @@ client.on("interactionCreate", async (interaction) => {
       return interaction.editReply({ embeds: [e] });
     }
 
+    // /cacheclear
+    if (interaction.commandName === "cacheclear") {
+      await interaction.deferReply({ ephemeral: true });
+
+      const mode = interaction.options.getString("mode") || "channel";
+
+      if (mode === "all") {
+        clearOldestCacheAll();
+        return interaction.editReply("✅ Đã xoá **toàn bộ** cache `oldestSigs`.");
+      }
+
+      // channel mode: xoá cache của những wallet đang nằm trong channel config? (không có list persistent)
+      // => Cho người dùng nhập list wallet (optional) hoặc xoá all (đã có)
+      // Ở đây mình làm: nếu mode=channel thì xoá cache những wallet user gửi qua option "wallets" (nếu có),
+      // còn không thì báo cách dùng.
+      const raw = interaction.options.getString("wallets") || "";
+      const wallets = raw ? [...new Set(parseWallets(raw))] : [];
+
+      if (wallets.length === 0) {
+        return interaction.editReply(
+          "⚠️ Mode `channel` cần nhập option `wallets` (paste nhiều dòng) để xoá cache cho đúng ví.\n" +
+            "Hoặc chọn `mode:all` để xoá hết."
+        );
+      }
+
+      const removed = clearOldestCacheWallets(wallets);
+      return interaction.editReply(`✅ Đã xoá cache cho **${removed}/${wallets.length}** ví.`);
+    }
+
     // /scan
     if (interaction.commandName === "scan") {
       await interaction.deferReply();
 
       const source = getSourceForChannel(guildId, channelId);
-      if (!source) {
-        return interaction.editReply(`⚠️ Channel này chưa set source. Dùng: \`/source wallet:YourSourceWallet\``);
-      }
+      if (!source) return interaction.editReply(`⚠️ Chưa set source. Dùng: \`/source wallet:YourSourceWallet\``);
 
+      const minSol = getMinForChannel(guildId, channelId);
       const timeHours = getTimeForChannel(guildId, channelId);
 
       const w = interaction.options.getString("wallet").trim().replace(/^"+|"+$/g, "");
       if (!looksLikeSolPubkey(w)) return interaction.editReply("❌ Wallet không hợp lệ.");
 
-      return runScanAndRespond(interaction, [w], source, timeHours, channelId);
+      return runScanAndRespond(interaction, [w], source, minSol, timeHours, channelId);
     }
 
     // /scanlist
@@ -659,27 +849,25 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.deferReply();
 
       const source = getSourceForChannel(guildId, channelId);
-      if (!source) {
-        return interaction.editReply(`⚠️ Channel này chưa set source. Dùng: \`/source wallet:YourSourceWallet\``);
-      }
+      if (!source) return interaction.editReply(`⚠️ Chưa set source. Dùng: \`/source wallet:YourSourceWallet\``);
 
+      const minSol = getMinForChannel(guildId, channelId);
       const timeHours = getTimeForChannel(guildId, channelId);
 
       const key = waitKey(guildId, interaction.user.id, channelId);
-      waiting.set(key, { expiresAt: Date.now() + 60_000, source, timeHours, channelId });
+      waiting.set(key, { expiresAt: Date.now() + 60_000, source, minSol, timeHours, channelId });
 
       const e = new EmbedBuilder()
         .setTitle("📝 Paste list hoặc upload .txt")
         .setColor(0xf1c40f)
         .setDescription(
           `**Channel:** <#${channelId}>\n` +
-            `Trong **60 giây**, bạn có thể:\n` +
-            `1) Paste list ví nhiều dòng, hoặc\n` +
-            `2) Upload file **message.txt / .txt** (Discord auto tạo cũng được)\n\n` +
+            `Trong **60 giây**, bạn có thể paste list ví hoặc upload file .txt\n\n` +
             `**Source:** ${shortPk(source)}\n` +
+            `**Min:** ${minSol} SOL\n` +
             `**Time window:** ${timeHours} giờ\n` +
-            `**Rule:** initial balance = 0\n\n` +
-            `Ví dụ paste:\n\`"wallet1"\n"wallet2"\n"wallet3"\``
+            `**Rule:** TX cũ nhất phải là funding từ Source\n\n` +
+            `Ví dụ:\n\`wallet1\nwallet2\nwallet3\``
         )
         .setTimestamp(new Date());
 
@@ -707,10 +895,8 @@ client.on("messageCreate", async (msg) => {
       return;
     }
 
-    // consume
     waiting.delete(key);
 
-    // Prefer attachment .txt if exists
     let rawText = msg.content || "";
     const att = pickTxtAttachment(msg);
 
@@ -723,14 +909,12 @@ client.on("messageCreate", async (msg) => {
     }
 
     const wallets = [...new Set(parseWallets(rawText))].slice(0, 250);
-    if (wallets.length === 0) {
-      return msg.reply("❌ Không thấy ví nào (paste sai format hoặc file rỗng).");
-    }
+    if (wallets.length === 0) return msg.reply("❌ Không thấy ví nào (paste sai format hoặc file rỗng).");
 
     const srcHint = att ? `📎 Đã đọc từ file: **${att.name}**` : "📝 Đã đọc từ message";
-    await msg.reply(`${srcHint}\n⏳ Đang scan **${wallets.length}** ví...`);
+    await msg.reply(`${srcHint}\n⏳ Đang scan **${wallets.length}** ví... (log ra console luôn)`);
 
-    return runScanAndRespond(msg, wallets, w.source, w.timeHours, w.channelId);
+    return runScanAndRespond(msg, wallets, w.source, w.minSol, w.timeHours, w.channelId);
   } catch {}
 });
 
@@ -749,12 +933,14 @@ client.on("messageCreate", async (msg) => {
 
   client.once(Events.ClientReady, (c) => {
     console.log(`✅ Bot logged in as ${c.user.tag}`);
+    console.log(`💰 Default Min: ${DEFAULT_MIN_SOL} SOL`);
     console.log(`⏱ Default Time: ${DEFAULT_TIME_HOURS} hours`);
     console.log(`🧩 Config scope: PER CHANNEL`);
     console.log(`📎 scanlist: supports .txt attachment`);
     console.log(`✨ autocomplete: /source wallet:<presetName>`);
-    console.log(`🎯 rule: within window, source->wallet, wallet preBalance == 0`);
-    console.log(`🧽 minSol: REMOVED`);
+    console.log(`🧠 Logic: OLDEST TX funding from SOURCE + time window`);
+    console.log(`⛔ Stop scan on rate limit + send Discord message`);
+    console.log(`💾 Cache: state.oldestSigs enabled`);
   });
 
   await client.login(process.env.DISCORD_BOT_TOKEN);
