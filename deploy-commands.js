@@ -57,20 +57,6 @@ const commands = [
       .addSubcommand((sc) => sc.setName("list").setDescription("Xem danh sách preset"))
   ),
 
-  // ================== /min ==================
-  cmd(
-    new SlashCommandBuilder()
-      .setName("min")
-      .setDescription("Set min SOL (ngưỡng tối thiểu) cho channel này")
-      .addNumberOption((opt) =>
-        opt
-          .setName("sol")
-          .setDescription("Min SOL, ví dụ 50")
-          .setRequired(true)
-          .setMinValue(0)
-      )
-  ),
-
   // ================== /time ==================
   cmd(
     new SlashCommandBuilder()
@@ -79,19 +65,15 @@ const commands = [
       .addNumberOption((opt) =>
         opt
           .setName("hours")
-          .setDescription("Số giờ, ví dụ 5")
+          .setDescription("Số giờ, ví dụ 48 / 168")
           .setRequired(true)
           .setMinValue(1)
-          .setMaxValue(48)
+          .setMaxValue(168) // ✅ 168 giờ
       )
   ),
 
   // ================== /show ==================
-  cmd(
-    new SlashCommandBuilder()
-      .setName("show")
-      .setDescription("Xem cấu hình hiện tại (source/min/time) của channel này")
-  ),
+  cmd(new SlashCommandBuilder().setName("show").setDescription("Xem cấu hình hiện tại (source/time) của channel này")),
 
   // ================== /scan ==================
   cmd(
@@ -143,8 +125,8 @@ const rest = new REST({ version: "10" }).setToken(token);
       body: commands,
     });
 
-    console.log("✅ Registered: /source (autocomplete) /preset /min /time /show /scan /scanlist");
-    console.log("ℹ️ Nếu chưa hiện autocomplete, chờ 1-2 phút hoặc restart Discord client.");
+    console.log("✅ Registered: /source (autocomplete) /preset /time(168h) /show /scan /scanlist");
+    console.log("ℹ️ Nếu command cũ (/min) vẫn còn hiện, chờ 1-2 phút hoặc restart Discord.");
   } catch (e) {
     console.error("❌ Register failed:", e?.message || e);
     process.exit(1);
