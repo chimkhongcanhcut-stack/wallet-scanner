@@ -2,7 +2,6 @@ require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
-const bs58 = require("bs58");
 const {
   Client,
   GatewayIntentBits,
@@ -16,11 +15,10 @@ const {
 
 // ================== CONFIG ==================
 const RPC_URL = process.env.RPC_URL;
-const DEBUG_SCAN = String(process.env.DEBUG_SCAN || "").toLowerCase() === "1";
 
-const DEFAULT_TIME_HOURS = 5;
+const DEFAULT_TIME_HOURS = 48; // default gợi ý cho bạn
 
-const SIG_FETCH_LIMIT = 120;
+const SIG_FETCH_LIMIT = 150; // tăng chút cho chắc
 const CONCURRENCY = 6;
 const REQUEST_TIMEOUT_MS = 20_000;
 
@@ -167,12 +165,12 @@ async function getSignatures(address, limit = 50) {
 }
 
 async function getTx(signature) {
-  // ✅ Dùng "json" để luôn có instruction raw (data/programIdIndex/accounts)
+  // jsonParsed để lấy pre/post balances chuẩn
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       return await rpc("getTransaction", [
         signature,
-        { encoding: "json", maxSupportedTransactionVersion: 0 },
+        { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 },
       ]);
     } catch (e) {
       if (attempt === 2) throw e;
@@ -187,77 +185,43 @@ async function getSolBalance(wallet) {
   return Number(res?.value || 0) / 1e9;
 }
 
-function lamportsToSol(l) {
-  return l / 1_000_000_000;
-}
-
-// ================== ROBUST SYSTEM TRANSFER PARSER ==================
-const SYSTEM_PROGRAM_ID = "11111111111111111111111111111111";
-
-// system instruction enum: Transfer = 2 (little-endian u32)
-function decodeSystemTransferData(dataB58) {
-  try {
-    const buf = bs58.decode(dataB58);
-    if (!buf || buf.length < 12) return null;
-    const ixType = buf.readUInt32LE(0);
-    if (ixType !== 2) return null; // only Transfer
-    // lamports u64 LE
-    const lamports = Number(buf.readBigUInt64LE(4));
-    return { lamports };
-  } catch {
-    return null;
-  }
-}
-
+// ================== FUNDING DETECT VIA BALANCE DIFF ==================
 function getAccountKeys(tx) {
   const keys = tx?.transaction?.message?.accountKeys || [];
-  // can be array of strings (json) OR objects (jsonParsed in some RPCs)
   return keys.map((k) => (typeof k === "string" ? k : k?.pubkey || k?.toString?.() || ""));
 }
 
-function extractSystemTransfers(tx) {
-  const out = [];
-  if (!tx) return out;
+function findLamportsTransferFromTo(tx, fromWallet, toWallet) {
+  // detect by balance diffs in accountKeys
+  // amount approx = decrease of from that matches increase of to (ignore fee; fee hits feePayer)
+  if (!tx?.meta) return null;
 
   const keys = getAccountKeys(tx);
+  const pre = tx.meta.preBalances || [];
+  const post = tx.meta.postBalances || [];
 
-  const handleIx = (ix) => {
-    // Case A: parsed (if RPC returns parsed anyway)
-    if (ix?.parsed?.type === "transfer" && (ix?.program === "system" || ix?.programId === SYSTEM_PROGRAM_ID)) {
-      const info = ix.parsed.info || {};
-      if (info.source && info.destination) {
-        out.push({ from: info.source, to: info.destination, lamports: Number(info.lamports || 0) });
-      }
-      return;
-    }
+  const fromIdx = keys.indexOf(fromWallet);
+  const toIdx = keys.indexOf(toWallet);
+  if (fromIdx === -1 || toIdx === -1) return null;
 
-    // Case B: raw (json)
-    const pid = typeof ix?.programId === "string"
-      ? ix.programId
-      : (Number.isInteger(ix?.programIdIndex) ? keys[ix.programIdIndex] : null);
+  const fromDelta = (post[fromIdx] ?? 0) - (pre[fromIdx] ?? 0); // negative
+  const toDelta = (post[toIdx] ?? 0) - (pre[toIdx] ?? 0); // positive
 
-    if (pid !== SYSTEM_PROGRAM_ID) return;
+  if (!(toDelta > 0)) return null;
 
-    const decoded = decodeSystemTransferData(ix?.data);
-    if (!decoded) return;
+  // take minimum of abs(fromDelta) and toDelta, this is "effective received"
+  const got = toDelta;
+  const paid = fromDelta < 0 ? -fromDelta : 0;
 
-    const accs = ix?.accounts || [];
-    const from = Number.isInteger(accs[0]) ? keys[accs[0]] : null;
-    const to = Number.isInteger(accs[1]) ? keys[accs[1]] : null;
-    if (!from || !to) return;
+  // Require from paid something (to avoid weird airdrop/other)
+  if (paid <= 0) return null;
 
-    out.push({ from, to, lamports: decoded.lamports });
-  };
+  // A bit tolerant: fee can reduce paid, but fee may be paid by from or another signer.
+  // We'll accept if paid >= got OR paid is close enough.
+  const ok = paid >= got || Math.abs(paid - got) <= 50_000; // 0.00005 SOL tolerance
+  if (!ok) return null;
 
-  // outer
-  for (const ix of tx?.transaction?.message?.instructions || []) handleIx(ix);
-
-  // inner
-  for (const group of tx?.meta?.innerInstructions || []) {
-    for (const ix of group?.instructions || []) handleIx(ix);
-  }
-
-  return out;
+  return { lamports: got };
 }
 
 // ================== INPUT PARSE ==================
@@ -289,6 +253,7 @@ async function downloadAttachmentText(att) {
   if (size > MAX_TXT_BYTES) {
     throw new Error(`File quá lớn (${Math.round(size / 1024)}KB). Max ~${Math.round(MAX_TXT_BYTES / 1024)}KB.`);
   }
+
   const url = att.url;
   const res = await axios.get(url, { responseType: "text", timeout: REQUEST_TIMEOUT_MS });
   if (typeof res.data !== "string") throw new Error("Không đọc được nội dung file text.");
@@ -312,78 +277,40 @@ async function mapLimit(arr, limit, fn) {
   return ret;
 }
 
-// ================== SCAN LOGIC ==================
+// ================== SCAN LOGIC (NEW) ==================
 async function scanWalletWithSource(wallet, sourceWallet, timeHours) {
   const sigs = await getSignatures(wallet, SIG_FETCH_LIMIT);
   if (!Array.isArray(sigs) || sigs.length === 0) return null;
 
-  const oldestTwo = sigs.slice(-2);
-
-  const txs = await Promise.all(
-    oldestTwo.map(async (s) => {
-      const sig = s.signature;
-      const tx = await getTx(sig);
-      const transfers = extractSystemTransfers(tx);
-      return {
-        sig,
-        blockTime: tx?.blockTime || null,
-        isTransferTx: transfers.length > 0,
-        transfers,
-      };
-    })
-  );
-
-  // DEBUG: show why it fails
-  if (DEBUG_SCAN) {
-    console.log("==== DEBUG_SCAN ====");
-    console.log("wallet:", wallet);
-    console.log("source:", sourceWallet);
-    console.log("sigs.length:", sigs.length, "oldestTwo:", oldestTwo.map((x) => x.signature));
-    console.log(
-      "txs:",
-      txs.map((t) => ({
-        sig: t.sig,
-        blockTime: t.blockTime,
-        isTransferTx: t.isTransferTx,
-        transfers: t.transfers.slice(0, 6),
-      }))
-    );
-  }
-
-  // Time window: cả 2 tx cũ nhất phải trong X giờ
   const nowSec = Math.floor(Date.now() / 1000);
   const maxAgeSec = Math.floor(timeHours * 3600);
-  for (const t of txs) {
-    if (!t.blockTime) return null;
-    if (nowSec - t.blockTime > maxAgeSec) return null;
-  }
 
-  // White-ish
-  const isCond1 = sigs.length === 1 && txs[0]?.isTransferTx === true;
-  const isCond2 = sigs.length >= 2 && txs.length >= 2 && txs[0].isTransferTx && txs[1].isTransferTx;
-  if (!isCond1 && !isCond2) return null;
+  // Filter signatures inside time window first (fast)
+  const inWindow = sigs.filter((s) => s?.blockTime && nowSec - s.blockTime <= maxAgeSec);
+  if (inWindow.length === 0) return null;
 
-  // Funding from source -> wallet (no min filter)
-  for (const t of txs) {
-    for (const tr of t.transfers) {
-      if (tr.from !== sourceWallet) continue;
-      if (tr.to !== wallet) continue;
+  // Scan newest -> older (prefer recent)
+  for (const s of inWindow) {
+    const sig = s.signature;
+    const tx = await getTx(sig);
+    if (!tx?.meta) continue;
 
-      const sol = lamportsToSol(tr.lamports);
-      const balance = await getSolBalance(wallet);
+    const found = findLamportsTransferFromTo(tx, sourceWallet, wallet);
+    if (!found) continue;
 
-      return {
-        wallet,
-        balance,
-        source: sourceWallet,
-        fundedSol: sol,
-        sig: t.sig,
-        fundingTime: formatTime(t.blockTime),
-        scannedAt: scanNowStr(),
-        txCondition: isCond1 ? "Điều kiện 1 (1 tx đầu là transfer)" : "Điều kiện 2 (2 tx đầu đều transfer)",
-        timeRule: `${timeHours} giờ`,
-      };
-    }
+    const balance = await getSolBalance(wallet);
+    const sol = found.lamports / 1e9;
+
+    return {
+      wallet,
+      balance,
+      source: sourceWallet,
+      fundedSol: sol,
+      sig,
+      fundingTime: formatTime(tx?.blockTime),
+      scannedAt: scanNowStr(),
+      timeRule: `${timeHours} giờ`,
+    };
   }
 
   return null;
@@ -392,12 +319,12 @@ async function scanWalletWithSource(wallet, sourceWallet, timeHours) {
 // ================== PRETTY OUTPUT ==================
 function makeSummaryEmbed({ source, timeHours, scannedCount, hitCount, channelId }) {
   return new EmbedBuilder()
-    .setTitle("🔎 Scan Result (Channel Config)")
+    .setTitle("🔎 Scan Result (Funding Detect)")
     .setColor(hitCount > 0 ? 0x2ecc71 : 0x95a5a6)
     .setDescription(
       `**Channel:** <#${channelId}>\n` +
         `**Source:** ${source ? `[${shortPk(source)}](${solscanTransfersUrl(source)})` : "*chưa set*"}\n` +
-        `**Time window:** **${timeHours} giờ** (2 tx cũ nhất)\n` +
+        `**Rule:** Detect **source → wallet** funding within **${timeHours} giờ**\n` +
         `**Scanned:** **${scannedCount}** • **Matched:** **${hitCount}**\n` +
         `**Scan time:** **${scanNowStr()}**`
     )
@@ -415,15 +342,14 @@ function makeWalletEmbed(hit) {
     .setDescription(
       `**Wallet:** [${hit.wallet}](${transfersLink})\n` +
         `**Balance:** **${Number(hit.balance || 0).toFixed(3)} SOL**\n\n` +
-        `**Tx:** **${hit.txCondition}**\n` +
         `**Funding time:** **${hit.fundingTime}**\n` +
         `**Scanned at:** **${hit.scannedAt}**\n` +
         `**Time rule:** **${hit.timeRule}**\n\n` +
         `**Source:** [${shortPk(hit.source)}](${solscanTransfersUrl(hit.source)})\n` +
-        `**Amount from source:** **${hit.fundedSol.toFixed(6)} SOL**\n` +
+        `**Amount detected:** **${hit.fundedSol.toFixed(6)} SOL**\n` +
         `**TX:** [Open on Solscan](${txLink})`
     )
-    .setFooter({ text: "Solana White-ish Funding Scanner" })
+    .setFooter({ text: "Solana Funding Detector (no 2-tx logic)" })
     .setTimestamp(new Date());
 }
 
@@ -446,7 +372,13 @@ async function runScanAndRespond(target, wallets, source, timeHours, channelId) 
   const hits = results.filter(Boolean);
   hits.sort((a, b) => b.fundedSol - a.fundedSol || b.balance - a.balance);
 
-  const summary = makeSummaryEmbed({ source, timeHours, scannedCount: wallets.length, hitCount: hits.length, channelId });
+  const summary = makeSummaryEmbed({
+    source,
+    timeHours,
+    scannedCount: wallets.length,
+    hitCount: hits.length,
+    channelId,
+  });
 
   if ("editReply" in target) {
     await target.editReply({ content: hits.length > 0 ? "@everyone" : "", embeds: [summary] });
@@ -483,6 +415,7 @@ client.on("interactionCreate", async (interaction) => {
   try {
     if (interaction.isAutocomplete()) {
       if (interaction.commandName !== "source") return;
+
       const focused = interaction.options.getFocused(true);
       if (!focused || focused.name !== "wallet") return;
 
@@ -509,6 +442,7 @@ client.on("interactionCreate", async (interaction) => {
 
     if (interaction.commandName === "show") {
       await interaction.deferReply();
+
       const source = getSourceForChannel(guildId, channelId);
       const timeHours = getTimeForChannel(guildId, channelId);
 
@@ -519,10 +453,11 @@ client.on("interactionCreate", async (interaction) => {
           `**Channel:** <#${channelId}>\n` +
             `**Source:** ${source ? `[${source}](${solscanTransfersUrl(source)})` : "*chưa set*"}\n` +
             `**Time window:** **${timeHours} giờ**\n\n` +
+            `Rule: match nếu tìm thấy **source → wallet** funding trong time window.\n\n` +
             `Dùng:\n` +
-            `- \`/source wallet:<pubkey>\` hoặc preset\n` +
+            `- \`/source wallet:<pubkey|preset>\`\n` +
             `- \`/preset add/del/list\`\n` +
-            `- \`/time hours:48\`\n` +
+            `- \`/time hours:168\`\n` +
             `- \`/scan wallet:<pubkey>\`\n` +
             `- \`/scanlist\``
         )
@@ -632,7 +567,7 @@ client.on("interactionCreate", async (interaction) => {
       const e = new EmbedBuilder()
         .setTitle("✅ Time Window Updated (This Channel)")
         .setColor(0xf39c12)
-        .setDescription(`**Channel:** <#${channelId}>\nTime window: **${h} giờ** (2 tx cũ nhất)`)
+        .setDescription(`**Channel:** <#${channelId}>\nTime window: **${h} giờ**`)
         .setTimestamp(new Date());
 
       return interaction.editReply({ embeds: [e] });
@@ -642,9 +577,7 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.deferReply();
 
       const source = getSourceForChannel(guildId, channelId);
-      if (!source) {
-        return interaction.editReply(`⚠️ Channel này chưa set source. Dùng: \`/source wallet:YourSourceWallet\``);
-      }
+      if (!source) return interaction.editReply(`⚠️ Channel này chưa set source. Dùng: \`/source wallet:YourSourceWallet\``);
 
       const timeHours = getTimeForChannel(guildId, channelId);
 
@@ -658,11 +591,10 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.deferReply();
 
       const source = getSourceForChannel(guildId, channelId);
-      if (!source) {
-        return interaction.editReply(`⚠️ Channel này chưa set source. Dùng: \`/source wallet:YourSourceWallet\``);
-      }
+      if (!source) return interaction.editReply(`⚠️ Channel này chưa set source. Dùng: \`/source wallet:YourSourceWallet\``);
 
       const timeHours = getTimeForChannel(guildId, channelId);
+
       const key = waitKey(guildId, interaction.user.id, channelId);
       waiting.set(key, { expiresAt: Date.now() + 60_000, source, timeHours, channelId });
 
@@ -742,13 +674,12 @@ client.on("messageCreate", async (msg) => {
 
   client.once(Events.ClientReady, (c) => {
     console.log(`✅ Bot logged in as ${c.user.tag}`);
-    console.log(`⏱ Default Time: ${DEFAULT_TIME_HOURS} hours`);
     console.log(`🧩 Config scope: PER CHANNEL`);
     console.log(`📎 scanlist: supports .txt attachment`);
     console.log(`✨ autocomplete: /source wallet:<presetName>`);
-    console.log(`✅ parser: ROBUST (raw decode system transfer)`);
+    console.log(`✅ logic: NO "2 oldest tx must be transfer" anymore`);
+    console.log(`✅ rule: detect SOL movement source -> wallet by balance diffs within time window`);
     console.log(`✅ /time max: 168h`);
-    console.log(`🧪 DEBUG_SCAN: ${DEBUG_SCAN ? "ON" : "OFF"} (set DEBUG_SCAN=1 in .env)`);
   });
 
   await client.login(process.env.DISCORD_BOT_TOKEN);
