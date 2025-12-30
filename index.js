@@ -16,33 +16,30 @@ const {
 // ================== CONFIG ==================
 const RPC_URL = process.env.RPC_URL;
 
-const DEFAULT_TIME_HOURS = 48; // default gợi ý cho bạn
-
-const SIG_FETCH_LIMIT = 150; // tăng chút cho chắc
+const DEFAULT_TIME_HOURS = 48; // default
+const SIG_FETCH_LIMIT = 200;   // tăng để chắc có tx trong window
 const CONCURRENCY = 6;
 const REQUEST_TIMEOUT_MS = 20_000;
 
 const STATE_FILE = path.join(__dirname, "state.json");
-const DEFAULT_SOURCE = "";
 
 // txt attachment limits
 const MAX_TXT_BYTES = 1_000_000; // 1MB
 
 // ================== STATE (PER-CHANNEL) ==================
-let state = { sources: {}, times: {}, presets: {} };
+let state = { times: {}, presets: {} };
 
 function loadState() {
   try {
     if (fs.existsSync(STATE_FILE)) {
       state = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-      if (!state || typeof state !== "object") state = { sources: {}, times: {}, presets: {} };
+      if (!state || typeof state !== "object") state = { times: {}, presets: {} };
 
-      if (!state.sources || typeof state.sources !== "object") state.sources = {};
       if (!state.times || typeof state.times !== "object") state.times = {};
       if (!state.presets || typeof state.presets !== "object") state.presets = {};
     }
   } catch {
-    state = { sources: {}, times: {}, presets: {} };
+    state = { times: {}, presets: {} };
   }
 }
 function saveState() {
@@ -54,14 +51,6 @@ function saveState() {
 }
 function scopeKey(guildId, channelId) {
   return `${guildId}:${channelId}`;
-}
-
-function getSourceForChannel(guildId, channelId) {
-  return state.sources[scopeKey(guildId, channelId)] || DEFAULT_SOURCE;
-}
-function setSourceForChannel(guildId, channelId, source) {
-  state.sources[scopeKey(guildId, channelId)] = source;
-  saveState();
 }
 
 function getTimeForChannel(guildId, channelId) {
@@ -80,35 +69,25 @@ function looksLikeSolPubkey(s) {
   return /^[1-9A-HJ-NP-Za-km-z]+$/.test(t);
 }
 
-// ================== PRESET (DEFAULT + USER) ==================
+// ================== PRESET (OPTIONAL, giữ cho vui) ==================
 const DEFAULT_SOURCE_PRESETS = {
   kucoin: "BmFdpraQhkiDQE6SnfG5omcA1VwzqfXrwtNYBwWTymy6",
   binance: "5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9",
 };
-
 function normalizePresetName(s) {
   return String(s || "").trim().replace(/^"+|"+$/g, "").toLowerCase();
 }
-
 function isValidPresetName(name) {
   return /^[a-z0-9_.-]{2,32}$/.test(name);
 }
-
 function getAllPresets() {
   return { ...DEFAULT_SOURCE_PRESETS, ...(state.presets || {}) };
 }
-
-function getPreset(name) {
-  const all = getAllPresets();
-  return all[name] || null;
-}
-
 function setPreset(name, wallet) {
   if (!state.presets || typeof state.presets !== "object") state.presets = {};
   state.presets[name] = wallet;
   saveState();
 }
-
 function delPreset(name) {
   if (!state.presets || typeof state.presets !== "object") state.presets = {};
   if (state.presets[name]) {
@@ -149,23 +128,16 @@ async function rpc(method, params) {
   const res = await axios.post(
     RPC_URL,
     { jsonrpc: "2.0", id: 1, method, params },
-    {
-      timeout: REQUEST_TIMEOUT_MS,
-      headers: { "Content-Type": "application/json" },
-      validateStatus: () => true,
-    }
+    { timeout: REQUEST_TIMEOUT_MS, headers: { "Content-Type": "application/json" } }
   );
   if (!res.data) throw new Error(`RPC empty response for ${method}`);
   if (res.data.error) throw new Error(res.data.error.message || "RPC error");
   return res.data.result;
 }
-
 async function getSignatures(address, limit = 50) {
   return rpc("getSignaturesForAddress", [address, { limit }]);
 }
-
 async function getTx(signature) {
-  // jsonParsed để lấy pre/post balances chuẩn
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       return await rpc("getTransaction", [
@@ -179,49 +151,33 @@ async function getTx(signature) {
   }
   return null;
 }
-
 async function getSolBalance(wallet) {
   const res = await rpc("getBalance", [wallet, { commitment: "confirmed" }]);
   return Number(res?.value || 0) / 1e9;
 }
 
-// ================== FUNDING DETECT VIA BALANCE DIFF ==================
 function getAccountKeys(tx) {
   const keys = tx?.transaction?.message?.accountKeys || [];
   return keys.map((k) => (typeof k === "string" ? k : k?.pubkey || k?.toString?.() || ""));
 }
 
-function findLamportsTransferFromTo(tx, fromWallet, toWallet) {
-  // detect by balance diffs in accountKeys
-  // amount approx = decrease of from that matches increase of to (ignore fee; fee hits feePayer)
+// ✅ core: detect wallet balance INCREASE in tx
+function detectIncreaseLamports(tx, wallet) {
   if (!tx?.meta) return null;
 
   const keys = getAccountKeys(tx);
-  const pre = tx.meta.preBalances || [];
-  const post = tx.meta.postBalances || [];
+  const idx = keys.indexOf(wallet);
+  if (idx === -1) return null;
 
-  const fromIdx = keys.indexOf(fromWallet);
-  const toIdx = keys.indexOf(toWallet);
-  if (fromIdx === -1 || toIdx === -1) return null;
+  const pre = tx.meta.preBalances?.[idx];
+  const post = tx.meta.postBalances?.[idx];
 
-  const fromDelta = (post[fromIdx] ?? 0) - (pre[fromIdx] ?? 0); // negative
-  const toDelta = (post[toIdx] ?? 0) - (pre[toIdx] ?? 0); // positive
+  if (!Number.isFinite(pre) || !Number.isFinite(post)) return null;
 
-  if (!(toDelta > 0)) return null;
+  const delta = post - pre;
+  if (delta > 0) return { lamports: delta };
 
-  // take minimum of abs(fromDelta) and toDelta, this is "effective received"
-  const got = toDelta;
-  const paid = fromDelta < 0 ? -fromDelta : 0;
-
-  // Require from paid something (to avoid weird airdrop/other)
-  if (paid <= 0) return null;
-
-  // A bit tolerant: fee can reduce paid, but fee may be paid by from or another signer.
-  // We'll accept if paid >= got OR paid is close enough.
-  const ok = paid >= got || Math.abs(paid - got) <= 50_000; // 0.00005 SOL tolerance
-  if (!ok) return null;
-
-  return { lamports: got };
+  return null;
 }
 
 // ================== INPUT PARSE ==================
@@ -241,21 +197,14 @@ function pickTxtAttachment(msg) {
 
   const byName = (a) => (a.name || "").toLowerCase();
   const isTxt = (a) => byName(a).endsWith(".txt") || byName(a) === "message.txt";
-  const txt = atts.find(isTxt);
-  if (txt) return txt;
-
-  const plain = atts.find((a) => (a.contentType || "").includes("text/plain"));
-  return plain || null;
+  return atts.find(isTxt) || atts.find((a) => (a.contentType || "").includes("text/plain")) || null;
 }
-
 async function downloadAttachmentText(att) {
   const size = Number(att.size || 0);
   if (size > MAX_TXT_BYTES) {
     throw new Error(`File quá lớn (${Math.round(size / 1024)}KB). Max ~${Math.round(MAX_TXT_BYTES / 1024)}KB.`);
   }
-
-  const url = att.url;
-  const res = await axios.get(url, { responseType: "text", timeout: REQUEST_TIMEOUT_MS });
+  const res = await axios.get(att.url, { responseType: "text", timeout: REQUEST_TIMEOUT_MS });
   if (typeof res.data !== "string") throw new Error("Không đọc được nội dung file text.");
   return res.data;
 }
@@ -277,35 +226,31 @@ async function mapLimit(arr, limit, fn) {
   return ret;
 }
 
-// ================== SCAN LOGIC (NEW) ==================
-async function scanWalletWithSource(wallet, sourceWallet, timeHours) {
+// ================== SCAN LOGIC (NEW SIMPLE) ==================
+async function scanWallet(wallet, timeHours) {
   const sigs = await getSignatures(wallet, SIG_FETCH_LIMIT);
   if (!Array.isArray(sigs) || sigs.length === 0) return null;
 
   const nowSec = Math.floor(Date.now() / 1000);
   const maxAgeSec = Math.floor(timeHours * 3600);
 
-  // Filter signatures inside time window first (fast)
+  // only sigs in window
   const inWindow = sigs.filter((s) => s?.blockTime && nowSec - s.blockTime <= maxAgeSec);
   if (inWindow.length === 0) return null;
 
-  // Scan newest -> older (prefer recent)
+  // scan newest -> older
   for (const s of inWindow) {
     const sig = s.signature;
     const tx = await getTx(sig);
-    if (!tx?.meta) continue;
-
-    const found = findLamportsTransferFromTo(tx, sourceWallet, wallet);
-    if (!found) continue;
+    const inc = detectIncreaseLamports(tx, wallet);
+    if (!inc) continue;
 
     const balance = await getSolBalance(wallet);
-    const sol = found.lamports / 1e9;
 
     return {
       wallet,
       balance,
-      source: sourceWallet,
-      fundedSol: sol,
+      increasedSol: inc.lamports / 1e9,
       sig,
       fundingTime: formatTime(tx?.blockTime),
       scannedAt: scanNowStr(),
@@ -317,14 +262,13 @@ async function scanWalletWithSource(wallet, sourceWallet, timeHours) {
 }
 
 // ================== PRETTY OUTPUT ==================
-function makeSummaryEmbed({ source, timeHours, scannedCount, hitCount, channelId }) {
+function makeSummaryEmbed({ timeHours, scannedCount, hitCount, channelId }) {
   return new EmbedBuilder()
-    .setTitle("🔎 Scan Result (Funding Detect)")
+    .setTitle("🔎 Scan Result (Balance Increase Detect)")
     .setColor(hitCount > 0 ? 0x2ecc71 : 0x95a5a6)
     .setDescription(
       `**Channel:** <#${channelId}>\n` +
-        `**Source:** ${source ? `[${shortPk(source)}](${solscanTransfersUrl(source)})` : "*chưa set*"}\n` +
-        `**Rule:** Detect **source → wallet** funding within **${timeHours} giờ**\n` +
+        `**Rule:** match nếu **SOL balance của ví tăng** trong **${timeHours} giờ**\n` +
         `**Scanned:** **${scannedCount}** • **Matched:** **${hitCount}**\n` +
         `**Scan time:** **${scanNowStr()}**`
     )
@@ -342,14 +286,13 @@ function makeWalletEmbed(hit) {
     .setDescription(
       `**Wallet:** [${hit.wallet}](${transfersLink})\n` +
         `**Balance:** **${Number(hit.balance || 0).toFixed(3)} SOL**\n\n` +
-        `**Funding time:** **${hit.fundingTime}**\n` +
-        `**Scanned at:** **${hit.scannedAt}**\n` +
-        `**Time rule:** **${hit.timeRule}**\n\n` +
-        `**Source:** [${shortPk(hit.source)}](${solscanTransfersUrl(hit.source)})\n` +
-        `**Amount detected:** **${hit.fundedSol.toFixed(6)} SOL**\n` +
-        `**TX:** [Open on Solscan](${txLink})`
+        `**Time rule:** **${hit.timeRule}**\n` +
+        `**Found at:** **${hit.fundingTime}**\n` +
+        `**Detected increase:** **+${hit.increasedSol.toFixed(6)} SOL**\n` +
+        `**TX:** [Open on Solscan](${txLink})\n` +
+        `**Scanned at:** **${hit.scannedAt}**`
     )
-    .setFooter({ text: "Solana Funding Detector (no 2-tx logic)" })
+    .setFooter({ text: "Solana Balance Increase Scanner" })
     .setTimestamp(new Date());
 }
 
@@ -360,20 +303,19 @@ function makeWalletButtons(hit) {
   );
 }
 
-async function runScanAndRespond(target, wallets, source, timeHours, channelId) {
+async function runScanAndRespond(target, wallets, timeHours, channelId) {
   const results = await mapLimit(wallets, CONCURRENCY, async (w) => {
     try {
-      return await scanWalletWithSource(w, source, timeHours);
+      return await scanWallet(w, timeHours);
     } catch {
       return null;
     }
   });
 
   const hits = results.filter(Boolean);
-  hits.sort((a, b) => b.fundedSol - a.fundedSol || b.balance - a.balance);
+  hits.sort((a, b) => b.increasedSol - a.increasedSol || b.balance - a.balance);
 
   const summary = makeSummaryEmbed({
-    source,
     timeHours,
     scannedCount: wallets.length,
     hitCount: hits.length,
@@ -392,7 +334,6 @@ async function runScanAndRespond(target, wallets, source, timeHours, channelId) 
   for (const h of top) {
     const embed = makeWalletEmbed(h);
     const row = makeWalletButtons(h);
-
     if ("followUp" in target) await target.followUp({ embeds: [embed], components: [row] });
     else await target.channel.send({ embeds: [embed], components: [row] });
   }
@@ -413,25 +354,10 @@ function waitKey(guildId, userId, channelId) {
 // ================== INTERACTIONS ==================
 client.on("interactionCreate", async (interaction) => {
   try {
+    // autocomplete (preset - optional)
     if (interaction.isAutocomplete()) {
-      if (interaction.commandName !== "source") return;
-
-      const focused = interaction.options.getFocused(true);
-      if (!focused || focused.name !== "wallet") return;
-
-      const q = String(focused.value || "").toLowerCase();
-      const presets = getAllPresets();
-      const keys = Object.keys(presets).sort();
-
-      const results = keys
-        .filter((k) => k.startsWith(q))
-        .slice(0, 25)
-        .map((k) => ({
-          name: `${k} (${presets[k].slice(0, 4)}…${presets[k].slice(-4)})`,
-          value: k,
-        }));
-
-      return interaction.respond(results);
+      if (interaction.commandName !== "preset") return;
+      return interaction.respond([]);
     }
 
     if (!interaction.isChatInputCommand()) return;
@@ -440,10 +366,9 @@ client.on("interactionCreate", async (interaction) => {
     const channelId = interaction.channelId;
     if (!guildId || !channelId) return;
 
+    // /show
     if (interaction.commandName === "show") {
       await interaction.deferReply();
-
-      const source = getSourceForChannel(guildId, channelId);
       const timeHours = getTimeForChannel(guildId, channelId);
 
       const e = new EmbedBuilder()
@@ -451,12 +376,9 @@ client.on("interactionCreate", async (interaction) => {
         .setColor(0x3498db)
         .setDescription(
           `**Channel:** <#${channelId}>\n` +
-            `**Source:** ${source ? `[${source}](${solscanTransfersUrl(source)})` : "*chưa set*"}\n` +
             `**Time window:** **${timeHours} giờ**\n\n` +
-            `Rule: match nếu tìm thấy **source → wallet** funding trong time window.\n\n` +
+            `Rule: match nếu **SOL balance của ví tăng** trong time window.\n\n` +
             `Dùng:\n` +
-            `- \`/source wallet:<pubkey|preset>\`\n` +
-            `- \`/preset add/del/list\`\n` +
             `- \`/time hours:168\`\n` +
             `- \`/scan wallet:<pubkey>\`\n` +
             `- \`/scanlist\``
@@ -466,102 +388,13 @@ client.on("interactionCreate", async (interaction) => {
       return interaction.editReply({ embeds: [e] });
     }
 
-    if (interaction.commandName === "preset") {
-      await interaction.deferReply();
-      const sub = interaction.options.getSubcommand();
-
-      if (sub === "add") {
-        const name = normalizePresetName(interaction.options.getString("name"));
-        const wallet = String(interaction.options.getString("wallet") || "").trim().replace(/^"+|"+$/g, "");
-
-        if (!name || !isValidPresetName(name)) {
-          return interaction.editReply("❌ Tên preset không hợp lệ (2-32 ký tự: a-z 0-9 _ - .).");
-        }
-        if (!looksLikeSolPubkey(wallet)) {
-          return interaction.editReply("❌ Wallet không hợp lệ (pubkey Solana).");
-        }
-
-        setPreset(name, wallet);
-
-        const e = new EmbedBuilder()
-          .setTitle("✅ Preset Added")
-          .setColor(0x2ecc71)
-          .setDescription(`**Name:** **${name}**\n**Wallet:** \`${wallet}\`\n\nDùng: \`/source wallet:${name}\``)
-          .setTimestamp(new Date());
-
-        return interaction.editReply({ embeds: [e] });
-      }
-
-      if (sub === "del") {
-        const name = normalizePresetName(interaction.options.getString("name"));
-        const ok = delPreset(name);
-        if (!ok) {
-          return interaction.editReply(
-            `⚠️ Không tìm thấy preset **${name}** trong user presets (default preset không xoá được).`
-          );
-        }
-        return interaction.editReply(`✅ Đã xoá preset **${name}**.`);
-      }
-
-      if (sub === "list") {
-        const all = getAllPresets();
-        const keys = Object.keys(all).sort();
-        if (keys.length === 0) return interaction.editReply("⚠️ Chưa có preset nào.");
-
-        const lines = keys.slice(0, 80).map((k) => `- **${k}** → \`${all[k]}\``);
-        const more = keys.length > 80 ? `\n… và còn **${keys.length - 80}** preset nữa.` : "";
-
-        const e = new EmbedBuilder()
-          .setTitle("📌 Preset List")
-          .setColor(0x3498db)
-          .setDescription(lines.join("\n") + more)
-          .setTimestamp(new Date());
-
-        return interaction.editReply({ embeds: [e] });
-      }
-
-      return interaction.editReply("❌ Subcommand không hợp lệ.");
-    }
-
-    if (interaction.commandName === "source") {
-      await interaction.deferReply();
-
-      const raw = interaction.options.getString("wallet");
-      const input = String(raw || "").trim().replace(/^"+|"+$/g, "");
-
-      const name = normalizePresetName(input);
-      const presetWallet = getPreset(name);
-      let source = presetWallet || input;
-
-      if (!presetWallet && !looksLikeSolPubkey(source)) {
-        return interaction.editReply(
-          "❌ Source không hợp lệ.\n" +
-            `- pubkey: \`/source wallet:5tzF...\`\n` +
-            `- preset: \`/source wallet:kucoin\`\n` +
-            `- quản lý: \`/preset add/del/list\``
-        );
-      }
-
-      setSourceForChannel(guildId, channelId, source);
-
-      const hint = presetWallet ? ` (preset: **${name}**)` : "";
-      const e = new EmbedBuilder()
-        .setTitle("✅ Source Updated (This Channel)")
-        .setColor(0x3498db)
-        .setDescription(`**Channel:** <#${channelId}>\nSource:${hint}\n**${source}**\n\nLink: ${solscanTransfersUrl(source)}`)
-        .setTimestamp(new Date());
-
-      return interaction.editReply({ embeds: [e] });
-    }
-
+    // /time
     if (interaction.commandName === "time") {
       await interaction.deferReply();
-
       const h = Number(interaction.options.getNumber("hours"));
       if (!Number.isFinite(h) || h < 1 || h > 168) {
         return interaction.editReply("❌ Hours không hợp lệ (1 → 168).");
       }
-
       setTimeForChannel(guildId, channelId, h);
 
       const e = new EmbedBuilder()
@@ -573,30 +406,24 @@ client.on("interactionCreate", async (interaction) => {
       return interaction.editReply({ embeds: [e] });
     }
 
+    // /scan
     if (interaction.commandName === "scan") {
       await interaction.deferReply();
-
-      const source = getSourceForChannel(guildId, channelId);
-      if (!source) return interaction.editReply(`⚠️ Channel này chưa set source. Dùng: \`/source wallet:YourSourceWallet\``);
-
       const timeHours = getTimeForChannel(guildId, channelId);
 
-      const w = interaction.options.getString("wallet").trim().replace(/^"+|"+$/g, "");
+      const w = interaction.options.getString("wallet")?.trim()?.replace(/^"+|"+$/g, "");
       if (!looksLikeSolPubkey(w)) return interaction.editReply("❌ Wallet không hợp lệ.");
 
-      return runScanAndRespond(interaction, [w], source, timeHours, channelId);
+      return runScanAndRespond(interaction, [w], timeHours, channelId);
     }
 
+    // /scanlist
     if (interaction.commandName === "scanlist") {
       await interaction.deferReply();
-
-      const source = getSourceForChannel(guildId, channelId);
-      if (!source) return interaction.editReply(`⚠️ Channel này chưa set source. Dùng: \`/source wallet:YourSourceWallet\``);
-
       const timeHours = getTimeForChannel(guildId, channelId);
 
       const key = waitKey(guildId, interaction.user.id, channelId);
-      waiting.set(key, { expiresAt: Date.now() + 60_000, source, timeHours, channelId });
+      waiting.set(key, { expiresAt: Date.now() + 60_000, timeHours, channelId });
 
       const e = new EmbedBuilder()
         .setTitle("📝 Paste list hoặc upload .txt")
@@ -606,7 +433,6 @@ client.on("interactionCreate", async (interaction) => {
             `Trong **60 giây**, bạn có thể:\n` +
             `1) Paste list ví nhiều dòng, hoặc\n` +
             `2) Upload file **message.txt / .txt**\n\n` +
-            `**Source:** ${shortPk(source)}\n` +
             `**Time window:** ${timeHours} giờ\n\n` +
             `Ví dụ paste:\n\`"wallet1"\n"wallet2"\n"wallet3"\``
         )
@@ -655,7 +481,7 @@ client.on("messageCreate", async (msg) => {
     const srcHint = att ? `📎 Đã đọc từ file: **${att.name}**` : "📝 Đã đọc từ message";
     await msg.reply(`${srcHint}\n⏳ Đang scan **${wallets.length}** ví...`);
 
-    return runScanAndRespond(msg, wallets, w.source, w.timeHours, w.channelId);
+    return runScanAndRespond(msg, wallets, w.timeHours, w.channelId);
   } catch {}
 });
 
@@ -676,9 +502,7 @@ client.on("messageCreate", async (msg) => {
     console.log(`✅ Bot logged in as ${c.user.tag}`);
     console.log(`🧩 Config scope: PER CHANNEL`);
     console.log(`📎 scanlist: supports .txt attachment`);
-    console.log(`✨ autocomplete: /source wallet:<presetName>`);
-    console.log(`✅ logic: NO "2 oldest tx must be transfer" anymore`);
-    console.log(`✅ rule: detect SOL movement source -> wallet by balance diffs within time window`);
+    console.log(`✅ logic: match if wallet balance increases within time window`);
     console.log(`✅ /time max: 168h`);
   });
 
