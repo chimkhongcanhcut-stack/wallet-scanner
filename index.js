@@ -16,6 +16,7 @@ const {
 // ================== CONFIG ==================
 const RPC_URL = process.env.RPC_URL;
 
+const DEFAULT_MIN_SOL = 50;
 const DEFAULT_TIME_HOURS = 5;
 
 const SIG_FETCH_LIMIT = 120;
@@ -29,24 +30,22 @@ const DEFAULT_SOURCE = "";
 const MAX_TXT_BYTES = 1_000_000; // 1MB
 
 // ================== STATE (PER-CHANNEL) ==================
-// ✅ removed mins
-let state = { sources: {}, times: {}, presets: {} };
+let state = { sources: {}, mins: {}, times: {}, presets: {} };
 
 function loadState() {
   try {
     if (fs.existsSync(STATE_FILE)) {
       state = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-      if (!state || typeof state !== "object") state = { sources: {}, times: {}, presets: {} };
+      if (!state || typeof state !== "object")
+        state = { sources: {}, mins: {}, times: {}, presets: {} };
 
       if (!state.sources || typeof state.sources !== "object") state.sources = {};
+      if (!state.mins || typeof state.mins !== "object") state.mins = {};
       if (!state.times || typeof state.times !== "object") state.times = {};
       if (!state.presets || typeof state.presets !== "object") state.presets = {};
-
-      // backward compat: xoá mins nếu file cũ còn
-      if (state.mins) delete state.mins;
     }
   } catch {
-    state = { sources: {}, times: {}, presets: {} };
+    state = { sources: {}, mins: {}, times: {}, presets: {} };
   }
 }
 function saveState() {
@@ -65,6 +64,15 @@ function getSourceForChannel(guildId, channelId) {
 }
 function setSourceForChannel(guildId, channelId, source) {
   state.sources[scopeKey(guildId, channelId)] = source;
+  saveState();
+}
+
+function getMinForChannel(guildId, channelId) {
+  const v = state.mins[scopeKey(guildId, channelId)];
+  return typeof v === "number" && Number.isFinite(v) ? v : DEFAULT_MIN_SOL;
+}
+function setMinForChannel(guildId, channelId, minSol) {
+  state.mins[scopeKey(guildId, channelId)] = minSol;
   saveState();
 }
 
@@ -93,21 +101,26 @@ const DEFAULT_SOURCE_PRESETS = {
 function normalizePresetName(s) {
   return String(s || "").trim().replace(/^"+|"+$/g, "").toLowerCase();
 }
+
 function isValidPresetName(name) {
   return /^[a-z0-9_.-]{2,32}$/.test(name);
 }
+
 function getAllPresets() {
   return { ...DEFAULT_SOURCE_PRESETS, ...(state.presets || {}) };
 }
+
 function getPreset(name) {
   const all = getAllPresets();
   return all[name] || null;
 }
+
 function setPreset(name, wallet) {
   if (!state.presets || typeof state.presets !== "object") state.presets = {};
   state.presets[name] = wallet;
   saveState();
 }
+
 function delPreset(name) {
   // chỉ xoá user preset; default preset không xoá được
   if (!state.presets || typeof state.presets !== "object") state.presets = {};
@@ -209,37 +222,6 @@ function extractSystemTransfers(tx) {
   return out;
 }
 
-// ================== INITIAL BALANCE CHECK ==================
-function getWalletPrePostLamports(tx, wallet) {
-  try {
-    const keys = tx?.transaction?.message?.accountKeys || [];
-    const pickPubkey = (k) => (typeof k === "string" ? k : k?.pubkey);
-
-    const idx = keys.findIndex((k) => pickPubkey(k) === wallet);
-    if (idx < 0) return { idx: -1, pre: null, post: null };
-
-    const pre = tx?.meta?.preBalances?.[idx];
-    const post = tx?.meta?.postBalances?.[idx];
-    return {
-      idx,
-      pre: typeof pre === "number" ? pre : null,
-      post: typeof post === "number" ? post : null,
-    };
-  } catch {
-    return { idx: -1, pre: null, post: null };
-  }
-}
-function getFeePayer(tx) {
-  try {
-    const keys = tx?.transaction?.message?.accountKeys || [];
-    if (!keys.length) return null;
-    const k0 = keys[0];
-    return typeof k0 === "string" ? k0 : k0?.pubkey || null;
-  } catch {
-    return null;
-  }
-}
-
 // ================== INPUT PARSE ==================
 function parseWallets(raw) {
   return raw
@@ -267,9 +249,7 @@ function pickTxtAttachment(msg) {
 async function downloadAttachmentText(att) {
   const size = Number(att.size || 0);
   if (size > MAX_TXT_BYTES) {
-    throw new Error(
-      `File quá lớn (${Math.round(size / 1024)}KB). Max ~${Math.round(MAX_TXT_BYTES / 1024)}KB.`
-    );
+    throw new Error(`File quá lớn (${Math.round(size / 1024)}KB). Max ~${Math.round(MAX_TXT_BYTES / 1024)}KB.`);
   }
 
   const url = att.url;
@@ -296,47 +276,47 @@ async function mapLimit(arr, limit, fn) {
 }
 
 // ================== SCAN LOGIC ==================
-// ✅ Removed: "2 tx cũ nhất" / white-ish oldest logic
-// ✅ Rule: within time window, funding tx where (from==source OR feePayer==source) AND to==wallet AND preBalance(wallet)==0
-async function scanWalletWithSource(wallet, sourceWallet, timeHours) {
+async function scanWalletWithSource(wallet, sourceWallet, minSol, timeHours) {
   const sigs = await getSignatures(wallet, SIG_FETCH_LIMIT);
   if (!Array.isArray(sigs) || sigs.length === 0) return null;
 
+  const oldestTwo = sigs.slice(-2);
+
+  const txs = await Promise.all(
+    oldestTwo.map(async (s) => {
+      const sig = s.signature;
+      const tx = await getTx(sig);
+      const transfers = extractSystemTransfers(tx);
+      return {
+        sig,
+        blockTime: tx?.blockTime || null,
+        isTransferTx: transfers.length > 0,
+        transfers,
+      };
+    })
+  );
+
+  // Time window: cả 2 tx cũ nhất phải trong X giờ
   const nowSec = Math.floor(Date.now() / 1000);
   const maxAgeSec = Math.floor(timeHours * 3600);
+  for (const t of txs) {
+    if (!t.blockTime) return null;
+    if (nowSec - t.blockTime > maxAgeSec) return null;
+  }
 
-  for (const s of sigs) {
-    const sig = s.signature;
-    if (!sig) continue;
+  // White-ish
+  const isCond1 = sigs.length === 1 && txs[0]?.isTransferTx === true;
+  const isCond2 = sigs.length >= 2 && txs.length >= 2 && txs[0].isTransferTx && txs[1].isTransferTx;
+  if (!isCond1 && !isCond2) return null;
 
-    // quick filter using signature blockTime if present
-    if (s.blockTime && nowSec - s.blockTime > maxAgeSec) continue;
-
-    let tx;
-    try {
-      tx = await getTx(sig);
-    } catch {
-      continue;
-    }
-    if (!tx?.blockTime) continue;
-    if (nowSec - tx.blockTime > maxAgeSec) continue;
-
-    const transfers = extractSystemTransfers(tx);
-    if (!transfers.length) continue;
-
-    // initial balance = 0
-    const pp = getWalletPrePostLamports(tx, wallet);
-    const preOk = pp.pre === 0;
-    const fallbackOk = pp.pre === null && typeof pp.post === "number" && pp.post > 0;
-    if (!preOk && !fallbackOk) continue;
-
-    const feePayer = getFeePayer(tx);
-
-    for (const tr of transfers) {
+  // Funding from source -> wallet >= minSol (trong 2 tx cũ nhất)
+  for (const t of txs) {
+    for (const tr of t.transfers) {
+      if (tr.from !== sourceWallet) continue;
       if (tr.to !== wallet) continue;
 
-      const sourceOk = tr.from === sourceWallet || feePayer === sourceWallet;
-      if (!sourceOk) continue;
+      const sol = lamportsToSol(tr.lamports);
+      if (sol < minSol) continue;
 
       const balance = await getSolBalance(wallet);
 
@@ -344,11 +324,13 @@ async function scanWalletWithSource(wallet, sourceWallet, timeHours) {
         wallet,
         balance,
         source: sourceWallet,
-        fundedSol: lamportsToSol(tr.lamports),
-        sig,
-        fundingTime: formatTime(tx.blockTime),
+        fundedSol: sol,
+        sig: t.sig,
+        fundingTime: formatTime(t.blockTime),
         scannedAt: scanNowStr(),
-        txCondition: "Funding trong time window + initial balance = 0",
+        txCondition: isCond1
+          ? "Điều kiện 1 (1 tx đầu là transfer)"
+          : "Điều kiện 2 (2 tx đầu đều transfer)",
         timeRule: `${timeHours} giờ`,
       };
     }
@@ -358,15 +340,15 @@ async function scanWalletWithSource(wallet, sourceWallet, timeHours) {
 }
 
 // ================== PRETTY OUTPUT ==================
-function makeSummaryEmbed({ source, timeHours, scannedCount, hitCount, channelId }) {
+function makeSummaryEmbed({ source, minSol, timeHours, scannedCount, hitCount, channelId }) {
   return new EmbedBuilder()
     .setTitle("🔎 Scan Result (Channel Config)")
     .setColor(hitCount > 0 ? 0x2ecc71 : 0x95a5a6)
     .setDescription(
       `**Channel:** <#${channelId}>\n` +
         `**Source:** ${source ? `[${shortPk(source)}](${solscanTransfersUrl(source)})` : "*chưa set*"}\n` +
-        `**Rule:** **initial balance = 0**\n` +
-        `**Time window:** **${timeHours} giờ** (within window)\n` +
+        `**Min amount:** **${minSol} SOL**\n` +
+        `**Time window:** **${timeHours} giờ** (2 tx cũ nhất)\n` +
         `**Scanned:** **${scannedCount}** • **Matched:** **${hitCount}**\n` +
         `**Scan time:** **${scanNowStr()}**`
     )
@@ -392,7 +374,7 @@ function makeWalletEmbed(hit) {
         `**Amount from source:** **${hit.fundedSol.toFixed(3)} SOL**\n` +
         `**TX:** [Open on Solscan](${txLink})`
     )
-    .setFooter({ text: "Solana Funding Scanner" })
+    .setFooter({ text: "Solana White-ish Funding Scanner" })
     .setTimestamp(new Date());
 }
 
@@ -403,10 +385,10 @@ function makeWalletButtons(hit) {
   );
 }
 
-async function runScanAndRespond(target, wallets, source, timeHours, channelId) {
+async function runScanAndRespond(target, wallets, source, minSol, timeHours, channelId) {
   const results = await mapLimit(wallets, CONCURRENCY, async (w) => {
     try {
-      return await scanWalletWithSource(w, source, timeHours);
+      return await scanWalletWithSource(w, source, minSol, timeHours);
     } catch {
       return null;
     }
@@ -417,6 +399,7 @@ async function runScanAndRespond(target, wallets, source, timeHours, channelId) 
 
   const summary = makeSummaryEmbed({
     source,
+    minSol,
     timeHours,
     scannedCount: wallets.length,
     hitCount: hits.length,
@@ -467,6 +450,7 @@ client.on("interactionCreate", async (interaction) => {
       const presets = getAllPresets();
       const keys = Object.keys(presets).sort();
 
+      // filter: startsWith (mượt)
       const results = keys
         .filter((k) => k.startsWith(q))
         .slice(0, 25)
@@ -490,6 +474,7 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.deferReply();
 
       const source = getSourceForChannel(guildId, channelId);
+      const minSol = getMinForChannel(guildId, channelId);
       const timeHours = getTimeForChannel(guildId, channelId);
 
       const e = new EmbedBuilder()
@@ -498,7 +483,7 @@ client.on("interactionCreate", async (interaction) => {
         .setDescription(
           `**Channel:** <#${channelId}>\n` +
             `**Source:** ${source ? `[${source}](${solscanTransfersUrl(source)})` : "*chưa set*"}\n` +
-            `**Rule:** **initial balance = 0**\n` +
+            `**Min SOL:** **${minSol}**\n` +
             `**Time window:** **${timeHours} giờ**\n\n` +
             `Dùng:\n` +
             `- \`/source wallet:<pubkey>\` (như cũ)\n` +
@@ -506,9 +491,8 @@ client.on("interactionCreate", async (interaction) => {
             `- \`/preset add name:<name> wallet:<pubkey>\`\n` +
             `- \`/preset del name:<name>\`\n` +
             `- \`/preset list\`\n` +
-            `- \`/time hours:5\` (1 → 168)\n` +
-            `- \`/scan wallet:<pubkey>\`\n` +
-            `- \`/scanlist\` rồi paste/upload .txt`
+            `- \`/min sol:50\`\n` +
+            `- \`/time hours:5\``
         )
         .setTimestamp(new Date());
 
@@ -617,13 +601,31 @@ client.on("interactionCreate", async (interaction) => {
       return interaction.editReply({ embeds: [e] });
     }
 
+    // /min
+    if (interaction.commandName === "min") {
+      await interaction.deferReply();
+
+      const v = Number(interaction.options.getNumber("sol"));
+      if (!Number.isFinite(v) || v < 0) return interaction.editReply("❌ Min SOL không hợp lệ.");
+
+      setMinForChannel(guildId, channelId, v);
+
+      const e = new EmbedBuilder()
+        .setTitle("✅ Min Updated (This Channel)")
+        .setColor(0x9b59b6)
+        .setDescription(`**Channel:** <#${channelId}>\nMin SOL: **${v} SOL**`)
+        .setTimestamp(new Date());
+
+      return interaction.editReply({ embeds: [e] });
+    }
+
     // /time
     if (interaction.commandName === "time") {
       await interaction.deferReply();
 
       const h = Number(interaction.options.getNumber("hours"));
-      if (!Number.isFinite(h) || h < 1 || h > 168) {
-        return interaction.editReply("❌ Hours không hợp lệ (1 → 168).");
+      if (!Number.isFinite(h) || h < 1 || h > 48) {
+        return interaction.editReply("❌ Hours không hợp lệ (1 → 48).");
       }
 
       setTimeForChannel(guildId, channelId, h);
@@ -631,7 +633,7 @@ client.on("interactionCreate", async (interaction) => {
       const e = new EmbedBuilder()
         .setTitle("✅ Time Window Updated (This Channel)")
         .setColor(0xf39c12)
-        .setDescription(`**Channel:** <#${channelId}>\nTime window: **${h} giờ**`)
+        .setDescription(`**Channel:** <#${channelId}>\nTime window: **${h} giờ** (2 tx cũ nhất)`)
         .setTimestamp(new Date());
 
       return interaction.editReply({ embeds: [e] });
@@ -646,12 +648,13 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply(`⚠️ Channel này chưa set source. Dùng: \`/source wallet:YourSourceWallet\``);
       }
 
+      const minSol = getMinForChannel(guildId, channelId);
       const timeHours = getTimeForChannel(guildId, channelId);
 
       const w = interaction.options.getString("wallet").trim().replace(/^"+|"+$/g, "");
       if (!looksLikeSolPubkey(w)) return interaction.editReply("❌ Wallet không hợp lệ.");
 
-      return runScanAndRespond(interaction, [w], source, timeHours, channelId);
+      return runScanAndRespond(interaction, [w], source, minSol, timeHours, channelId);
     }
 
     // /scanlist
@@ -663,10 +666,11 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply(`⚠️ Channel này chưa set source. Dùng: \`/source wallet:YourSourceWallet\``);
       }
 
+      const minSol = getMinForChannel(guildId, channelId);
       const timeHours = getTimeForChannel(guildId, channelId);
 
       const key = waitKey(guildId, interaction.user.id, channelId);
-      waiting.set(key, { expiresAt: Date.now() + 60_000, source, timeHours, channelId });
+      waiting.set(key, { expiresAt: Date.now() + 60_000, source, minSol, timeHours, channelId });
 
       const e = new EmbedBuilder()
         .setTitle("📝 Paste list hoặc upload .txt")
@@ -677,8 +681,8 @@ client.on("interactionCreate", async (interaction) => {
             `1) Paste list ví nhiều dòng, hoặc\n` +
             `2) Upload file **message.txt / .txt** (Discord auto tạo cũng được)\n\n` +
             `**Source:** ${shortPk(source)}\n` +
-            `**Time window:** ${timeHours} giờ\n` +
-            `**Rule:** initial balance = 0\n\n` +
+            `**Min:** ${minSol} SOL\n` +
+            `**Time window:** ${timeHours} giờ\n\n` +
             `Ví dụ paste:\n\`"wallet1"\n"wallet2"\n"wallet3"\``
         )
         .setTimestamp(new Date());
@@ -730,7 +734,7 @@ client.on("messageCreate", async (msg) => {
     const srcHint = att ? `📎 Đã đọc từ file: **${att.name}**` : "📝 Đã đọc từ message";
     await msg.reply(`${srcHint}\n⏳ Đang scan **${wallets.length}** ví...`);
 
-    return runScanAndRespond(msg, wallets, w.source, w.timeHours, w.channelId);
+    return runScanAndRespond(msg, wallets, w.source, w.minSol, w.timeHours, w.channelId);
   } catch {}
 });
 
@@ -749,12 +753,11 @@ client.on("messageCreate", async (msg) => {
 
   client.once(Events.ClientReady, (c) => {
     console.log(`✅ Bot logged in as ${c.user.tag}`);
+    console.log(`💰 Default Min: ${DEFAULT_MIN_SOL} SOL`);
     console.log(`⏱ Default Time: ${DEFAULT_TIME_HOURS} hours`);
     console.log(`🧩 Config scope: PER CHANNEL`);
     console.log(`📎 scanlist: supports .txt attachment`);
     console.log(`✨ autocomplete: /source wallet:<presetName>`);
-    console.log(`🎯 rule: within window, source->wallet, wallet preBalance == 0`);
-    console.log(`🧽 minSol: REMOVED`);
   });
 
   await client.login(process.env.DISCORD_BOT_TOKEN);
