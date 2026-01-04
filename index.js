@@ -11,6 +11,7 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  AttachmentBuilder,
 } = require("discord.js");
 
 // ================== CONFIG ==================
@@ -219,10 +220,8 @@ async function rpc(method, params) {
     }
   );
 
-  // HTTP rate limit
   if (res.status === 429) throw new RateLimitError(`Rate limited (HTTP 429) on ${method}`);
 
-  // Some providers return 200 but error.message contains rate limit
   if (res.data?.error?.message && isRateLimitMessage(res.data.error.message)) {
     throw new RateLimitError(`Rate limited on ${method}: ${res.data.error.message}`);
   }
@@ -288,7 +287,6 @@ function extractSystemTransfers(tx) {
 async function findOldestCached(address, timeHours) {
   const cached = getCachedOldest(address);
   if (cached) {
-    // if cached sig has blockTime and now too old -> convert to TOO_OLD
     if (cached.sig && cached.blockTime && isOlderThanWindow(cached.blockTime, timeHours)) {
       const obj = { marker: "TOO_OLD", blockTime: cached.blockTime, sig: cached.sig };
       setCachedOldest(address, obj);
@@ -409,7 +407,6 @@ async function scanWalletWithSource(wallet, sourceWallet, timeHours) {
   const tx = await getTx(oldestSig);
   const blockTime = tx?.blockTime || info.blockTime || null;
 
-  // time window check again (covers signature blockTime null)
   if (blockTime && isOlderThanWindow(blockTime, timeHours)) {
     console.log(`[WHITE] ${wallet} -> SKIP (oldest too old after tx) bt=${blockTime} window=${timeHours}h`);
     setCachedOldest(wallet, { marker: "TOO_OLD", blockTime, sig: oldestSig });
@@ -422,7 +419,6 @@ async function scanWalletWithSource(wallet, sourceWallet, timeHours) {
     if (tr.from !== sourceWallet) continue;
     if (tr.to !== wallet) continue;
 
-    // ✅ REMOVE MIN CHECK: chỉ cần match đúng rule là notify
     const sol = lamportsToSol(tr.lamports);
     const balance = await getSolBalance(wallet);
 
@@ -448,6 +444,24 @@ async function scanWalletWithSource(wallet, sourceWallet, timeHours) {
   console.log(`[WHITE] ❌ NOT wallet=${wallet} oldestSig=${oldestSig} time=${blockTime}`);
   setCachedOldest(wallet, { sig: oldestSig, blockTime });
   return null;
+}
+
+// ================== MATCHES TXT FILE ==================
+function buildMatchesTxt(hits) {
+  // Format đúng như bạn muốn: wallet balance sol
+  // ví dụ: wallet1 1.0000 sol
+  return (
+    hits
+      .map((h) => `${h.wallet} ${Number(h.balance || 0).toFixed(4)} sol`)
+      .join("\n") + "\n"
+  );
+}
+
+function makeMatchesAttachment(hits) {
+  const content = buildMatchesTxt(hits);
+  const buf = Buffer.from(content, "utf8");
+  const filename = `matched_${Date.now()}.txt`;
+  return new AttachmentBuilder(buf, { name: filename });
 }
 
 // ================== PRETTY OUTPUT ==================
@@ -555,14 +569,23 @@ async function runScanAndRespond(target, wallets, source, timeHours, channelId) 
     stoppedReason: stoppedReason || "",
   });
 
-  // send summary
+  // ✅ Attach txt file if has matches
+  const files = hits.length > 0 ? [makeMatchesAttachment(hits)] : [];
+
   if ("editReply" in target) {
-    await target.editReply({ content: hits.length > 0 ? "@everyone" : "", embeds: [summary] });
+    await target.editReply({
+      content: hits.length > 0 ? "@everyone" : "",
+      embeds: [summary],
+      files,
+    });
   } else {
-    await target.reply({ content: hits.length > 0 ? "@everyone" : "", embeds: [summary] });
+    await target.reply({
+      content: hits.length > 0 ? "@everyone" : "",
+      embeds: [summary],
+      files,
+    });
   }
 
-  // if stopped => notify explicitly
   if (stoppedReason) {
     await sendStoppedMessage(target, stoppedReason);
     return;
@@ -644,7 +667,8 @@ client.on("interactionCreate", async (interaction) => {
             `- \`/time hours:5\`\n` +
             `- \`/scan wallet:<wallet>\`\n` +
             `- \`/scanlist\`\n` +
-            `- \`/cacheclear\``
+            `- \`/cacheclear\`\n\n` +
+            `📎 Scan xong có match sẽ gửi kèm file .txt: \`wallet balance sol\``
         )
         .setTimestamp(new Date());
 
@@ -902,7 +926,7 @@ client.on("messageCreate", async (msg) => {
     console.log(`🧠 Logic: OLDEST TX funding from SOURCE + time window`);
     console.log(`⛔ Stop scan on rate limit + send Discord message`);
     console.log(`💾 Cache: state.oldestSigs enabled`);
-    console.log(`🧹 Min SOL: REMOVED`);
+    console.log(`📄 Matched list: send .txt (wallet balance sol)`);
   });
 
   await client.login(process.env.DISCORD_BOT_TOKEN);
