@@ -16,7 +16,6 @@ const {
 // ================== CONFIG ==================
 const RPC_URL = process.env.RPC_URL;
 
-const DEFAULT_MIN_SOL = 50;
 const DEFAULT_TIME_HOURS = 5;
 
 const CONCURRENCY = 2; // scan nhẹ để đỡ rate
@@ -32,23 +31,22 @@ const SIG_PAGE_LIMIT = 1000; // max getSignaturesForAddress
 const MAX_TXT_BYTES = 1_000_000; // 1MB
 
 // ================== STATE (PER-CHANNEL) ==================
-let state = { sources: {}, mins: {}, times: {}, presets: {}, oldestSigs: {} };
+let state = { sources: {}, times: {}, presets: {}, oldestSigs: {} };
 
 function loadState() {
   try {
     if (fs.existsSync(STATE_FILE)) {
       state = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
       if (!state || typeof state !== "object")
-        state = { sources: {}, mins: {}, times: {}, presets: {}, oldestSigs: {} };
+        state = { sources: {}, times: {}, presets: {}, oldestSigs: {} };
 
       if (!state.sources || typeof state.sources !== "object") state.sources = {};
-      if (!state.mins || typeof state.mins !== "object") state.mins = {};
       if (!state.times || typeof state.times !== "object") state.times = {};
       if (!state.presets || typeof state.presets !== "object") state.presets = {};
       if (!state.oldestSigs || typeof state.oldestSigs !== "object") state.oldestSigs = {};
     }
   } catch {
-    state = { sources: {}, mins: {}, times: {}, presets: {}, oldestSigs: {} };
+    state = { sources: {}, times: {}, presets: {}, oldestSigs: {} };
   }
 }
 
@@ -69,15 +67,6 @@ function getSourceForChannel(guildId, channelId) {
 }
 function setSourceForChannel(guildId, channelId, source) {
   state.sources[scopeKey(guildId, channelId)] = source;
-  saveState();
-}
-
-function getMinForChannel(guildId, channelId) {
-  const v = state.mins[scopeKey(guildId, channelId)];
-  return typeof v === "number" && Number.isFinite(v) ? v : DEFAULT_MIN_SOL;
-}
-function setMinForChannel(guildId, channelId, minSol) {
-  state.mins[scopeKey(guildId, channelId)] = minSol;
   saveState();
 }
 
@@ -393,7 +382,7 @@ async function mapLimit(arr, limit, fn, shouldStop) {
 }
 
 // ================== SCAN LOGIC ==================
-async function scanWalletWithSource(wallet, sourceWallet, minSol, timeHours) {
+async function scanWalletWithSource(wallet, sourceWallet, timeHours) {
   const info = await findOldestCached(wallet, timeHours);
 
   if (info.marker === "NO_HISTORY") {
@@ -433,9 +422,8 @@ async function scanWalletWithSource(wallet, sourceWallet, minSol, timeHours) {
     if (tr.from !== sourceWallet) continue;
     if (tr.to !== wallet) continue;
 
+    // ✅ REMOVE MIN CHECK: chỉ cần match đúng rule là notify
     const sol = lamportsToSol(tr.lamports);
-    if (sol < minSol) continue;
-
     const balance = await getSolBalance(wallet);
 
     console.log(
@@ -463,7 +451,7 @@ async function scanWalletWithSource(wallet, sourceWallet, minSol, timeHours) {
 }
 
 // ================== PRETTY OUTPUT ==================
-function makeSummaryEmbed({ source, minSol, timeHours, scannedCount, hitCount, channelId, stoppedReason }) {
+function makeSummaryEmbed({ source, timeHours, scannedCount, hitCount, channelId, stoppedReason }) {
   const color = stoppedReason ? 0xe67e22 : hitCount > 0 ? 0x2ecc71 : 0x95a5a6;
   const title = stoppedReason
     ? "⛔ Scan Stopped (Rate Limit)"
@@ -479,7 +467,6 @@ function makeSummaryEmbed({ source, minSol, timeHours, scannedCount, hitCount, c
     .setDescription(
       `**Channel:** <#${channelId}>\n` +
         `**Source:** ${source ? `[${shortPk(source)}](${solscanTransfersUrl(source)})` : "*chưa set*"}\n` +
-        `**Min amount:** **${minSol} SOL**\n` +
         `**Time window:** **${timeHours} giờ**\n` +
         `**Rule:** TX cũ nhất phải là funding từ Source\n` +
         `**Scanned:** **${scannedCount}** • **Matched:** **${hitCount}**\n` +
@@ -528,7 +515,7 @@ async function sendStoppedMessage(target, reason) {
   } catch {}
 }
 
-async function runScanAndRespond(target, wallets, source, minSol, timeHours, channelId) {
+async function runScanAndRespond(target, wallets, source, timeHours, channelId) {
   let stoppedReason = "";
   let scannedSoFar = 0;
 
@@ -542,7 +529,7 @@ async function runScanAndRespond(target, wallets, source, minSol, timeHours, cha
       scannedSoFar++;
 
       try {
-        return await scanWalletWithSource(w, source, minSol, timeHours);
+        return await scanWalletWithSource(w, source, timeHours);
       } catch (e) {
         if (e?.isRateLimit || e?.name === "RateLimitError") {
           stoppedReason = e.message || "Rate limit";
@@ -561,7 +548,6 @@ async function runScanAndRespond(target, wallets, source, minSol, timeHours, cha
 
   const summary = makeSummaryEmbed({
     source,
-    minSol,
     timeHours,
     scannedCount: stoppedReason ? scannedSoFar : wallets.length,
     hitCount: hits.length,
@@ -642,7 +628,6 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.deferReply();
 
       const source = getSourceForChannel(guildId, channelId);
-      const minSol = getMinForChannel(guildId, channelId);
       const timeHours = getTimeForChannel(guildId, channelId);
 
       const e = new EmbedBuilder()
@@ -651,13 +636,11 @@ client.on("interactionCreate", async (interaction) => {
         .setDescription(
           `**Channel:** <#${channelId}>\n` +
             `**Source:** ${source ? `[${source}](${solscanTransfersUrl(source)})` : "*chưa set*"}\n` +
-            `**Min SOL:** **${minSol}**\n` +
             `**Time window:** **${timeHours} giờ**\n` +
             `**Rule:** TX cũ nhất phải là funding từ Source\n\n` +
             `Dùng:\n` +
             `- \`/source wallet:<pubkey>\` hoặc \`/source wallet:<presetName>\`\n` +
             `- \`/preset add/del/list\`\n` +
-            `- \`/min sol:50\`\n` +
             `- \`/time hours:5\`\n` +
             `- \`/scan wallet:<wallet>\`\n` +
             `- \`/scanlist\`\n` +
@@ -765,24 +748,6 @@ client.on("interactionCreate", async (interaction) => {
       return interaction.editReply({ embeds: [e] });
     }
 
-    // /min
-    if (interaction.commandName === "min") {
-      await interaction.deferReply();
-
-      const v = Number(interaction.options.getNumber("sol"));
-      if (!Number.isFinite(v) || v < 0) return interaction.editReply("❌ Min SOL không hợp lệ.");
-
-      setMinForChannel(guildId, channelId, v);
-
-      const e = new EmbedBuilder()
-        .setTitle("✅ Min Updated (This Channel)")
-        .setColor(0x9b59b6)
-        .setDescription(`**Channel:** <#${channelId}>\nMin SOL: **${v} SOL**`)
-        .setTimestamp(new Date());
-
-      return interaction.editReply({ embeds: [e] });
-    }
-
     // /time
     if (interaction.commandName === "time") {
       await interaction.deferReply();
@@ -814,10 +779,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply("✅ Đã xoá **toàn bộ** cache `oldestSigs`.");
       }
 
-      // channel mode: xoá cache của những wallet đang nằm trong channel config? (không có list persistent)
-      // => Cho người dùng nhập list wallet (optional) hoặc xoá all (đã có)
-      // Ở đây mình làm: nếu mode=channel thì xoá cache những wallet user gửi qua option "wallets" (nếu có),
-      // còn không thì báo cách dùng.
       const raw = interaction.options.getString("wallets") || "";
       const wallets = raw ? [...new Set(parseWallets(raw))] : [];
 
@@ -839,13 +800,12 @@ client.on("interactionCreate", async (interaction) => {
       const source = getSourceForChannel(guildId, channelId);
       if (!source) return interaction.editReply(`⚠️ Chưa set source. Dùng: \`/source wallet:YourSourceWallet\``);
 
-      const minSol = getMinForChannel(guildId, channelId);
       const timeHours = getTimeForChannel(guildId, channelId);
 
       const w = interaction.options.getString("wallet").trim().replace(/^"+|"+$/g, "");
       if (!looksLikeSolPubkey(w)) return interaction.editReply("❌ Wallet không hợp lệ.");
 
-      return runScanAndRespond(interaction, [w], source, minSol, timeHours, channelId);
+      return runScanAndRespond(interaction, [w], source, timeHours, channelId);
     }
 
     // /scanlist
@@ -855,11 +815,10 @@ client.on("interactionCreate", async (interaction) => {
       const source = getSourceForChannel(guildId, channelId);
       if (!source) return interaction.editReply(`⚠️ Chưa set source. Dùng: \`/source wallet:YourSourceWallet\``);
 
-      const minSol = getMinForChannel(guildId, channelId);
       const timeHours = getTimeForChannel(guildId, channelId);
 
       const key = waitKey(guildId, interaction.user.id, channelId);
-      waiting.set(key, { expiresAt: Date.now() + 60_000, source, minSol, timeHours, channelId });
+      waiting.set(key, { expiresAt: Date.now() + 60_000, source, timeHours, channelId });
 
       const e = new EmbedBuilder()
         .setTitle("📝 Paste list hoặc upload .txt")
@@ -868,7 +827,6 @@ client.on("interactionCreate", async (interaction) => {
           `**Channel:** <#${channelId}>\n` +
             `Trong **60 giây**, bạn có thể paste list ví hoặc upload file .txt\n\n` +
             `**Source:** ${shortPk(source)}\n` +
-            `**Min:** ${minSol} SOL\n` +
             `**Time window:** ${timeHours} giờ\n` +
             `**Rule:** TX cũ nhất phải là funding từ Source\n\n` +
             `Ví dụ:\n\`wallet1\nwallet2\nwallet3\``
@@ -918,7 +876,7 @@ client.on("messageCreate", async (msg) => {
     const srcHint = att ? `📎 Đã đọc từ file: **${att.name}**` : "📝 Đã đọc từ message";
     await msg.reply(`${srcHint}\n⏳ Đang scan **${wallets.length}** ví... (log ra console luôn)`);
 
-    return runScanAndRespond(msg, wallets, w.source, w.minSol, w.timeHours, w.channelId);
+    return runScanAndRespond(msg, wallets, w.source, w.timeHours, w.channelId);
   } catch {}
 });
 
@@ -937,7 +895,6 @@ client.on("messageCreate", async (msg) => {
 
   client.once(Events.ClientReady, (c) => {
     console.log(`✅ Bot logged in as ${c.user.tag}`);
-    console.log(`💰 Default Min: ${DEFAULT_MIN_SOL} SOL`);
     console.log(`⏱ Default Time: ${DEFAULT_TIME_HOURS} hours`);
     console.log(`🧩 Config scope: PER CHANNEL`);
     console.log(`📎 scanlist: supports .txt attachment`);
@@ -945,6 +902,7 @@ client.on("messageCreate", async (msg) => {
     console.log(`🧠 Logic: OLDEST TX funding from SOURCE + time window`);
     console.log(`⛔ Stop scan on rate limit + send Discord message`);
     console.log(`💾 Cache: state.oldestSigs enabled`);
+    console.log(`🧹 Min SOL: REMOVED`);
   });
 
   await client.login(process.env.DISCORD_BOT_TOKEN);
