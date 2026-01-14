@@ -22,8 +22,9 @@ const ALLOWED_GUILD_IDS_RAW = String(
   process.env.ALLOWED_GUILD_IDS || process.env.ALLOWED_GUILD_ID || ""
 ).trim();
 
-// câu reply khi dùng sai server (theo đúng yêu cầu của bạn)
-const UNAUTHORIZED_MSG = 'dùng bot mà k có sự cho phép của a, tin nhắn m bị lộ hết r kìa cu =))';
+// câu reply khi dùng sai server
+const UNAUTHORIZED_MSG =
+  "dùng bot mà k có sự cho phép của a, tin nhắn m bị lộ hết r kìa cu =))";
 
 function parseAllowedGuilds(raw) {
   return new Set(
@@ -41,7 +42,6 @@ function isAllowedGuild(guildId) {
 }
 
 const DEFAULT_TIME_HOURS = 5;
-
 const CONCURRENCY = 2; // scan nhẹ để đỡ rate
 const REQUEST_TIMEOUT_MS = 20_000;
 
@@ -111,7 +111,6 @@ function looksLikeSolPubkey(s) {
 }
 
 // ================== OLDEST SIG CACHE ==================
-// state.oldestSigs[wallet] = { sig, blockTime } OR { marker: "TOO_MANY_TX"|"TOO_OLD"|"NO_HISTORY", blockTime?, sig? }
 function getCachedOldest(wallet) {
   const v = state.oldestSigs?.[wallet];
   if (!v || typeof v !== "object") return null;
@@ -180,7 +179,7 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.MessageContent, // ⚠️ cần bật ở Developer Portal nữa
   ],
   partials: [Partials.Channel],
 });
@@ -220,10 +219,7 @@ function nowSec() {
 }
 function isOlderThanWindow(blockTime, timeHours) {
   if (!Number.isFinite(blockTime)) return false;
-
-  // nếu blockTime lớn hơn hiện tại > 1 ngày => chắc chắn là SLOT → bỏ check
-  if (blockTime > nowSec() + 86400) return false;
-
+  if (blockTime > nowSec() + 86400) return false; // slot -> bỏ check
   const maxAge = Number(timeHours) * 3600;
   return nowSec() - blockTime > maxAge;
 }
@@ -543,8 +539,14 @@ function makeWalletEmbed(hit) {
 
 function makeWalletButtons(hit) {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setLabel("Open Transfers").setStyle(ButtonStyle.Link).setURL(solscanTransfersUrl(hit.wallet)),
-    new ButtonBuilder().setLabel("Open TX").setStyle(ButtonStyle.Link).setURL(solscanTxUrl(hit.sig))
+    new ButtonBuilder()
+      .setLabel("Open Transfers")
+      .setStyle(ButtonStyle.Link)
+      .setURL(solscanTransfersUrl(hit.wallet)),
+    new ButtonBuilder()
+      .setLabel("Open TX")
+      .setStyle(ButtonStyle.Link)
+      .setURL(solscanTxUrl(hit.sig))
   );
 }
 
@@ -597,7 +599,6 @@ async function runScanAndRespond(target, wallets, source, timeHours, channelId) 
     stoppedReason: stoppedReason || "",
   });
 
-  // ✅ Attach txt file if has matches
   const files = hits.length > 0 ? [makeMatchesAttachment(hits)] : [];
 
   if ("editReply" in target) {
@@ -637,11 +638,36 @@ async function runScanAndRespond(target, wallets, source, timeHours, channelId) 
   }
 }
 
-// ================== /scanlist WAITING ==================
-// ✅ FIX: key only by guild+user (avoid mismatch when user pastes in different channel/thread)
-const waiting = new Map(); // key = guild:user
-function waitKey(guildId, userId) {
-  return `${guildId}:${userId}`;
+// ================== COLLECTOR: WAIT INPUT AFTER /scanlist ==================
+async function collectScanlistInput(interaction, channelId, timeoutMs = 60_000) {
+  const channel = interaction.channel;
+  if (!channel) return null;
+
+  const filter = (m) =>
+    m &&
+    m.author &&
+    m.author.id === interaction.user.id &&
+    m.channelId === channelId;
+
+  try {
+    const collected = await channel.awaitMessages({
+      filter,
+      max: 1,
+      time: timeoutMs,
+    });
+
+    const msg = collected.first();
+    if (!msg) return null;
+
+    let rawText = msg.content || "";
+    const att = pickTxtAttachment(msg);
+
+    if (att) rawText = await downloadAttachmentText(att);
+
+    return { msg, rawText };
+  } catch {
+    return null;
+  }
 }
 
 // ================== INTERACTIONS ==================
@@ -651,7 +677,6 @@ client.on("interactionCreate", async (interaction) => {
     if (!interaction.guildId) return;
 
     if (!isAllowedGuild(interaction.guildId)) {
-      // autocomplete: im lặng để khỏi spam
       if (interaction.isAutocomplete()) {
         try {
           return interaction.respond([]);
@@ -659,8 +684,6 @@ client.on("interactionCreate", async (interaction) => {
           return;
         }
       }
-
-      // command: nói đúng câu bạn yêu cầu
       if (interaction.isChatInputCommand()) {
         try {
           if (!interaction.deferred && !interaction.replied) {
@@ -719,7 +742,7 @@ client.on("interactionCreate", async (interaction) => {
             `- \`/preset add/del/list\`\n` +
             `- \`/time hours:5\`\n` +
             `- \`/scan wallet:<wallet>\`\n` +
-            `- \`/scanlist\`\n` +
+            `- \`/scanlist\` (collector)\n` +
             `- \`/cacheclear\`\n\n` +
             `📎 Scan xong có match sẽ gửi kèm file .txt: \`wallet balance sol\``
         )
@@ -875,7 +898,8 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.deferReply();
 
       const source = getSourceForChannel(guildId, channelId);
-      if (!source) return interaction.editReply(`⚠️ Chưa set source. Dùng: \`/source wallet:YourSourceWallet\``);
+      if (!source)
+        return interaction.editReply(`⚠️ Chưa set source. Dùng: \`/source wallet:YourSourceWallet\``);
 
       const timeHours = getTimeForChannel(guildId, channelId);
 
@@ -885,24 +909,22 @@ client.on("interactionCreate", async (interaction) => {
       return runScanAndRespond(interaction, [w], source, timeHours, channelId);
     }
 
-    // /scanlist
+    // ✅ /scanlist (COLLECTOR)
     if (interaction.commandName === "scanlist") {
       await interaction.deferReply();
 
       const source = getSourceForChannel(guildId, channelId);
-      if (!source) return interaction.editReply(`⚠️ Chưa set source. Dùng: \`/source wallet:YourSourceWallet\``);
+      if (!source)
+        return interaction.editReply(`⚠️ Chưa set source. Dùng: \`/source wallet:YourSourceWallet\``);
 
       const timeHours = getTimeForChannel(guildId, channelId);
-
-      const key = waitKey(guildId, interaction.user.id);
-      waiting.set(key, { expiresAt: Date.now() + 60_000, source, timeHours, channelId });
 
       const e = new EmbedBuilder()
         .setTitle("📝 Paste list hoặc upload .txt")
         .setColor(0xf1c40f)
         .setDescription(
           `**Channel:** <#${channelId}>\n` +
-            `Trong **60 giây**, bạn có thể paste list ví hoặc upload file .txt\n\n` +
+            `Trong **60 giây**, bạn paste list ví hoặc upload file .txt (chỉ bạn gửi bot mới nhận)\n\n` +
             `**Source:** ${shortPk(source)}\n` +
             `**Time window:** ${timeHours} giờ\n` +
             `**Rule:** TX cũ nhất phải là funding từ Source\n\n` +
@@ -910,63 +932,33 @@ client.on("interactionCreate", async (interaction) => {
         )
         .setTimestamp(new Date());
 
-      return interaction.editReply({ embeds: [e] });
+      await interaction.editReply({ embeds: [e] });
+
+      const collected = await collectScanlistInput(interaction, channelId, 60_000);
+      if (!collected) {
+        return interaction.followUp({
+          content: "⏰ Hết 60s rồi bro. Gõ lại `/scanlist` để scan list nhé.",
+          ephemeral: true,
+        });
+      }
+
+      const { msg, rawText } = collected;
+
+      const wallets = [...new Set(parseWallets(rawText))].slice(0, 250);
+      if (wallets.length === 0) return msg.reply("❌ Không thấy ví nào (paste sai format hoặc file rỗng).");
+
+      const att = pickTxtAttachment(msg);
+      const srcHint = att ? `📎 Đã đọc từ file: **${att.name}**` : "📝 Đã đọc từ message";
+      await msg.reply(`${srcHint}\n⏳ Đang scan **${wallets.length}** ví... (log ra console luôn)`);
+
+      return runScanAndRespond(msg, wallets, source, timeHours, channelId);
     }
   } catch (e) {
     try {
-      if (interaction.deferred || interaction.replied) await interaction.editReply(`❌ Lỗi: ${e.message}`);
+      if (interaction.deferred || interaction.replied)
+        await interaction.editReply(`❌ Lỗi: ${e.message}`);
     } catch {}
   }
-});
-
-// ================== MESSAGE HANDLER FOR /scanlist ==================
-client.on("messageCreate", async (msg) => {console.log("[MSG]", msg.guildId, msg.channelId, "parent=", msg.channel?.parentId || "-", "thread=", !!msg.channel?.isThread?.());
-
-  try {
-    if (msg.author.bot) return;
-    if (!msg.guildId) return;
-
-    // PRIVATE LOCK: sai server thì bỏ qua
-    if (!isAllowedGuild(msg.guildId)) return;
-
-    const key = waitKey(msg.guildId, msg.author.id);
-    const w = waiting.get(key);
-    if (!w) return;
-
-    if (Date.now() > w.expiresAt) {
-      waiting.delete(key);
-      return;
-    }
-
-    // ✅ REQUIRE SAME CHANNEL AS WHERE /scanlist was called
-    // (avoid user pasting somewhere else accidentally)
-    const sameChannel = msg.channelId === w.channelId;
-const inThreadOfChannel =
-  Boolean(msg.channel?.isThread?.()) && String(msg.channel.parentId) === String(w.channelId);
-
-if (!sameChannel && !inThreadOfChannel) return;
-
-    waiting.delete(key);
-
-    let rawText = msg.content || "";
-    const att = pickTxtAttachment(msg);
-
-    if (att) {
-      try {
-        rawText = await downloadAttachmentText(att);
-      } catch (e) {
-        return msg.reply(`❌ Không đọc được file .txt: ${e.message}`);
-      }
-    }
-
-    const wallets = [...new Set(parseWallets(rawText))].slice(0, 250);
-    if (wallets.length === 0) return msg.reply("❌ Không thấy ví nào (paste sai format hoặc file rỗng).");
-
-    const srcHint = att ? `📎 Đã đọc từ file: **${att.name}**` : "📝 Đã đọc từ message";
-    await msg.reply(`${srcHint}\n⏳ Đang scan **${wallets.length}** ví... (log ra console luôn)`);
-
-    return runScanAndRespond(msg, wallets, w.source, w.timeHours, w.channelId);
-  } catch {}
 });
 
 // ================== START ==================
@@ -998,7 +990,6 @@ if (!sameChannel && !inThreadOfChannel) return;
     console.log(`💾 Cache: state.oldestSigs enabled`);
     console.log(`📄 Matched list: send .txt (wallet balance sol)`);
 
-    // dọn sạch: nếu bot đang ở server lạ thì leave luôn
     for (const g of c.guilds.cache.values()) {
       if (!isAllowedGuild(g.id)) {
         try {
