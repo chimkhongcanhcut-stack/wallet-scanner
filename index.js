@@ -939,7 +939,11 @@ client.on("messageCreate", async (msg) => {
 
     // ✅ REQUIRE SAME CHANNEL AS WHERE /scanlist was called
     // (avoid user pasting somewhere else accidentally)
-    if (msg.channelId !== w.channelId) return;
+    const sameChannel = msg.channelId === w.channelId;
+const inThreadOfChannel =
+  Boolean(msg.channel?.isThread?.()) && String(msg.channel.parentId) === String(w.channelId);
+
+if (!sameChannel && !inThreadOfChannel) return;
 
     waiting.delete(key);
 
