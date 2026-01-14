@@ -1,4 +1,3 @@
-
 require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
@@ -17,13 +16,26 @@ const {
 
 // ================== CONFIG ==================
 const RPC_URL = process.env.RPC_URL;
-const ALLOWED_GUILD_ID = String(process.env.ALLOWED_GUILD_ID || "").trim();
+
+// ✅ allow multiple guilds
+const ALLOWED_GUILD_IDS = String(process.env.ALLOWED_GUILD_IDS || "").trim();
 
 // câu reply khi dùng sai server (theo đúng yêu cầu của bạn)
-const UNAUTHORIZED_MSG = 'dùng bot mà k có sự cho phép của a, tin nhắn m bị lộ hết r kìa cu =))';
+const UNAUTHORIZED_MSG = "dùng bot mà k có sự cho phép của a, tin nhắn m bị lộ hết r kìa cu =))";
+
+function parseAllowedGuilds(raw) {
+  return new Set(
+    String(raw || "")
+      .split(/[,\s]+/)
+      .map((s) => s.trim())
+      .filter(Boolean)
+  );
+}
+const ALLOWED_GUILDS_SET = parseAllowedGuilds(ALLOWED_GUILD_IDS);
 
 function isAllowedGuild(guildId) {
-  return Boolean(ALLOWED_GUILD_ID) && String(guildId) === ALLOWED_GUILD_ID;
+  if (!guildId) return false;
+  return ALLOWED_GUILDS_SET.has(String(guildId));
 }
 
 const DEFAULT_TIME_HOURS = 5;
@@ -469,7 +481,6 @@ async function scanWalletWithSource(wallet, sourceWallet, timeHours) {
 
 // ================== MATCHES TXT FILE ==================
 function buildMatchesTxt(hits) {
-  // Format đúng như bạn muốn: wallet balance sol
   return hits.map((h) => `${h.wallet} ${Number(h.balance || 0).toFixed(4)} sol`).join("\n") + "\n";
 }
 function makeMatchesAttachment(hits) {
@@ -584,7 +595,6 @@ async function runScanAndRespond(target, wallets, source, timeHours, channelId) 
     stoppedReason: stoppedReason || "",
   });
 
-  // ✅ Attach txt file if has matches
   const files = hits.length > 0 ? [makeMatchesAttachment(hits)] : [];
 
   if ("editReply" in target) {
@@ -956,8 +966,8 @@ client.on("messageCreate", async (msg) => {
     console.error("❌ Missing DISCORD_BOT_TOKEN in .env");
     process.exit(1);
   }
-  if (!ALLOWED_GUILD_ID) {
-    console.error("❌ Missing ALLOWED_GUILD_ID in .env (private bot mode)");
+  if (!ALLOWED_GUILD_IDS || ALLOWED_GUILDS_SET.size === 0) {
+    console.error("❌ Missing ALLOWED_GUILD_IDS in .env (private bot mode)");
     process.exit(1);
   }
 
@@ -965,7 +975,7 @@ client.on("messageCreate", async (msg) => {
 
   client.once(Events.ClientReady, async (c) => {
     console.log(`✅ Bot logged in as ${c.user.tag}`);
-    console.log(`🔒 Private mode: ALLOWED_GUILD_ID=${ALLOWED_GUILD_ID}`);
+    console.log(`🔒 Private mode: ALLOWED_GUILD_IDS=${[...ALLOWED_GUILDS_SET].join(",")}`);
     console.log(`⏱ Default Time: ${DEFAULT_TIME_HOURS} hours`);
     console.log(`🧩 Config scope: PER CHANNEL`);
     console.log(`📎 scanlist: supports .txt attachment`);
