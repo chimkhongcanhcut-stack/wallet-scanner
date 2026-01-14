@@ -17,11 +17,13 @@ const {
 // ================== CONFIG ==================
 const RPC_URL = process.env.RPC_URL;
 
-// ✅ allow multiple guilds
-const ALLOWED_GUILD_IDS = String(process.env.ALLOWED_GUILD_IDS || "").trim();
+// ✅ BACKWARD COMPAT: support both ALLOWED_GUILD_IDS and ALLOWED_GUILD_ID
+const ALLOWED_GUILD_IDS_RAW = String(
+  process.env.ALLOWED_GUILD_IDS || process.env.ALLOWED_GUILD_ID || ""
+).trim();
 
 // câu reply khi dùng sai server (theo đúng yêu cầu của bạn)
-const UNAUTHORIZED_MSG = "dùng bot mà k có sự cho phép của a, tin nhắn m bị lộ hết r kìa cu =))";
+const UNAUTHORIZED_MSG = 'dùng bot mà k có sự cho phép của a, tin nhắn m bị lộ hết r kìa cu =))';
 
 function parseAllowedGuilds(raw) {
   return new Set(
@@ -31,7 +33,7 @@ function parseAllowedGuilds(raw) {
       .filter(Boolean)
   );
 }
-const ALLOWED_GUILDS_SET = parseAllowedGuilds(ALLOWED_GUILD_IDS);
+const ALLOWED_GUILDS_SET = parseAllowedGuilds(ALLOWED_GUILD_IDS_RAW);
 
 function isAllowedGuild(guildId) {
   if (!guildId) return false;
@@ -595,6 +597,7 @@ async function runScanAndRespond(target, wallets, source, timeHours, channelId) 
     stoppedReason: stoppedReason || "",
   });
 
+  // ✅ Attach txt file if has matches
   const files = hits.length > 0 ? [makeMatchesAttachment(hits)] : [];
 
   if ("editReply" in target) {
@@ -635,7 +638,8 @@ async function runScanAndRespond(target, wallets, source, timeHours, channelId) 
 }
 
 // ================== /scanlist WAITING ==================
-const waiting = new Map(); // key = guild:user:channel
+// ✅ FIX: key only by guild+user (avoid mismatch when user pastes in different channel/thread)
+const waiting = new Map(); // key = guild:user
 function waitKey(guildId, userId) {
   return `${guildId}:${userId}`;
 }
@@ -891,8 +895,7 @@ client.on("interactionCreate", async (interaction) => {
       const timeHours = getTimeForChannel(guildId, channelId);
 
       const key = waitKey(guildId, interaction.user.id);
-waiting.set(key, { expiresAt: Date.now() + 60_000, source, timeHours, channelId });
-
+      waiting.set(key, { expiresAt: Date.now() + 60_000, source, timeHours, channelId });
 
       const e = new EmbedBuilder()
         .setTitle("📝 Paste list hoặc upload .txt")
@@ -926,7 +929,6 @@ client.on("messageCreate", async (msg) => {
     if (!isAllowedGuild(msg.guildId)) return;
 
     const key = waitKey(msg.guildId, msg.author.id);
-
     const w = waiting.get(key);
     if (!w) return;
 
@@ -934,6 +936,10 @@ client.on("messageCreate", async (msg) => {
       waiting.delete(key);
       return;
     }
+
+    // ✅ REQUIRE SAME CHANNEL AS WHERE /scanlist was called
+    // (avoid user pasting somewhere else accidentally)
+    if (msg.channelId !== w.channelId) return;
 
     waiting.delete(key);
 
@@ -968,8 +974,8 @@ client.on("messageCreate", async (msg) => {
     console.error("❌ Missing DISCORD_BOT_TOKEN in .env");
     process.exit(1);
   }
-  if (!ALLOWED_GUILD_IDS || ALLOWED_GUILDS_SET.size === 0) {
-    console.error("❌ Missing ALLOWED_GUILD_IDS in .env (private bot mode)");
+  if (!ALLOWED_GUILD_IDS_RAW || ALLOWED_GUILDS_SET.size === 0) {
+    console.error("❌ Missing ALLOWED_GUILD_IDS or ALLOWED_GUILD_ID in .env (private bot mode)");
     process.exit(1);
   }
 
