@@ -24,7 +24,7 @@ const ALLOWED_GUILD_IDS_RAW = String(
 
 // câu reply khi dùng sai server
 const UNAUTHORIZED_MSG =
-  "dùng bot mà k có sự cho phép của a, tin nhắn m bị lộ hết r kìa cu =))";
+  "bot này bot mua bro ơi dms @mjiohaa trên telegram để mua nhé";
 
 // câu cảnh báo upsell khi bot bị add vào server lạ
 const WARN_MSG =
