@@ -16,6 +16,14 @@ const {
 
 // ================== CONFIG ==================
 const RPC_URL = process.env.RPC_URL;
+const ALLOWED_GUILD_ID = String(process.env.ALLOWED_GUILD_ID || "").trim();
+
+// câu reply khi dùng sai server (theo đúng yêu cầu của bạn)
+const UNAUTHORIZED_MSG = 'dùng bot mà k có sự cho phép của a, tin nhắn m bị lộ hết r kìa cu =))';
+
+function isAllowedGuild(guildId) {
+  return Boolean(ALLOWED_GUILD_ID) && String(guildId) === ALLOWED_GUILD_ID;
+}
 
 const DEFAULT_TIME_HOURS = 5;
 
@@ -160,6 +168,18 @@ const client = new Client({
     GatewayIntentBits.MessageContent,
   ],
   partials: [Partials.Channel],
+});
+
+// ================== PRIVATE BOT: AUTO LEAVE OTHER GUILDS ==================
+client.on(Events.GuildCreate, async (guild) => {
+  try {
+    if (!isAllowedGuild(guild.id)) {
+      console.log(`⛔ Joined unauthorized guild ${guild.id} (${guild.name}) -> leaving`);
+      await guild.leave();
+    }
+  } catch (e) {
+    console.log("⚠️ guild.leave failed:", e.message);
+  }
 });
 
 // ================== UI HELPERS ==================
@@ -449,14 +469,8 @@ async function scanWalletWithSource(wallet, sourceWallet, timeHours) {
 // ================== MATCHES TXT FILE ==================
 function buildMatchesTxt(hits) {
   // Format đúng như bạn muốn: wallet balance sol
-  // ví dụ: wallet1 1.0000 sol
-  return (
-    hits
-      .map((h) => `${h.wallet} ${Number(h.balance || 0).toFixed(4)} sol`)
-      .join("\n") + "\n"
-  );
+  return hits.map((h) => `${h.wallet} ${Number(h.balance || 0).toFixed(4)} sol`).join("\n") + "\n";
 }
-
 function makeMatchesAttachment(hits) {
   const content = buildMatchesTxt(hits);
   const buf = Buffer.from(content, "utf8");
@@ -618,6 +632,30 @@ function waitKey(guildId, userId, channelId) {
 // ================== INTERACTIONS ==================
 client.on("interactionCreate", async (interaction) => {
   try {
+    // PRIVATE LOCK: chặn DM + chặn sai server
+    if (!interaction.guildId) return;
+
+    if (!isAllowedGuild(interaction.guildId)) {
+      // autocomplete: im lặng để khỏi spam
+      if (interaction.isAutocomplete()) {
+        try {
+          return interaction.respond([]);
+        } catch {
+          return;
+        }
+      }
+
+      // command: nói đúng câu bạn yêu cầu
+      if (interaction.isChatInputCommand()) {
+        try {
+          if (!interaction.deferred && !interaction.replied) {
+            await interaction.reply({ content: UNAUTHORIZED_MSG, ephemeral: true });
+          }
+        } catch {}
+      }
+      return;
+    }
+
     // AUTOCOMPLETE (/source wallet)
     if (interaction.isAutocomplete()) {
       if (interaction.commandName !== "source") return;
@@ -872,6 +910,9 @@ client.on("messageCreate", async (msg) => {
     if (msg.author.bot) return;
     if (!msg.guildId) return;
 
+    // PRIVATE LOCK: sai server thì bỏ qua
+    if (!isAllowedGuild(msg.guildId)) return;
+
     const key = waitKey(msg.guildId, msg.author.id, msg.channelId);
     const w = waiting.get(key);
     if (!w) return;
@@ -914,11 +955,16 @@ client.on("messageCreate", async (msg) => {
     console.error("❌ Missing DISCORD_BOT_TOKEN in .env");
     process.exit(1);
   }
+  if (!ALLOWED_GUILD_ID) {
+    console.error("❌ Missing ALLOWED_GUILD_ID in .env (private bot mode)");
+    process.exit(1);
+  }
 
   loadState();
 
-  client.once(Events.ClientReady, (c) => {
+  client.once(Events.ClientReady, async (c) => {
     console.log(`✅ Bot logged in as ${c.user.tag}`);
+    console.log(`🔒 Private mode: ALLOWED_GUILD_ID=${ALLOWED_GUILD_ID}`);
     console.log(`⏱ Default Time: ${DEFAULT_TIME_HOURS} hours`);
     console.log(`🧩 Config scope: PER CHANNEL`);
     console.log(`📎 scanlist: supports .txt attachment`);
@@ -927,6 +973,16 @@ client.on("messageCreate", async (msg) => {
     console.log(`⛔ Stop scan on rate limit + send Discord message`);
     console.log(`💾 Cache: state.oldestSigs enabled`);
     console.log(`📄 Matched list: send .txt (wallet balance sol)`);
+
+    // dọn sạch: nếu bot đang ở server lạ thì leave luôn
+    for (const g of c.guilds.cache.values()) {
+      if (!isAllowedGuild(g.id)) {
+        try {
+          console.log(`⛔ Leaving unauthorized guild ${g.id} (${g.name})`);
+          await g.leave();
+        } catch {}
+      }
+    }
   });
 
   await client.login(process.env.DISCORD_BOT_TOKEN);
