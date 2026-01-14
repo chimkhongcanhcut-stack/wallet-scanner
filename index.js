@@ -636,8 +636,8 @@ async function runScanAndRespond(target, wallets, source, timeHours, channelId) 
 
 // ================== /scanlist WAITING ==================
 const waiting = new Map(); // key = guild:user:channel
-function waitKey(guildId, userId, channelId) {
-  return `${guildId}:${userId}:${channelId}`;
+function waitKey(guildId, userId) {
+  return `${guildId}:${userId}`;
 }
 
 // ================== INTERACTIONS ==================
@@ -890,8 +890,9 @@ client.on("interactionCreate", async (interaction) => {
 
       const timeHours = getTimeForChannel(guildId, channelId);
 
-      const key = waitKey(guildId, interaction.user.id, channelId);
-      waiting.set(key, { expiresAt: Date.now() + 60_000, source, timeHours, channelId });
+      const key = waitKey(guildId, interaction.user.id);
+waiting.set(key, { expiresAt: Date.now() + 60_000, source, timeHours, channelId });
+
 
       const e = new EmbedBuilder()
         .setTitle("📝 Paste list hoặc upload .txt")
@@ -924,7 +925,8 @@ client.on("messageCreate", async (msg) => {
     // PRIVATE LOCK: sai server thì bỏ qua
     if (!isAllowedGuild(msg.guildId)) return;
 
-    const key = waitKey(msg.guildId, msg.author.id, msg.channelId);
+    const key = waitKey(msg.guildId, msg.author.id);
+
     const w = waiting.get(key);
     if (!w) return;
 
