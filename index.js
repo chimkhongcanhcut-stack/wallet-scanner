@@ -1,989 +1,152 @@
 require("dotenv").config();
-const fs = require("fs");
-const path = require("path");
-const axios = require("axios");
-const {
-  Client,
-  GatewayIntentBits,
-  EmbedBuilder,
-  Partials,
-  Events,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  AttachmentBuilder,
-} = require("discord.js");
+const { Telegraf } = require("telegraf");
 
-// ================== CONFIG ==================
-const RPC_URL = process.env.RPC_URL;
-const ALLOWED_GUILD_ID = String(process.env.ALLOWED_GUILD_ID || "").trim();
-
-// câu reply khi dùng sai server (theo đúng yêu cầu của bạn)
-const UNAUTHORIZED_MSG = 'dùng bot mà k có sự cho phép của a, tin nhắn m bị lộ hết r kìa cu =))';
-
-function isAllowedGuild(guildId) {
-  return Boolean(ALLOWED_GUILD_ID) && String(guildId) === ALLOWED_GUILD_ID;
+// ================== ENV ==================
+const BOT_TOKEN = process.env.BOT_TOKEN;
+if (!BOT_TOKEN) {
+  console.error("❌ Missing BOT_TOKEN in .env");
+  process.exit(1);
 }
 
-const DEFAULT_TIME_HOURS = 5;
+// Allowed group chat IDs (2 group thôi cũng ok, cứ để list)
+const ALLOWED = (process.env.ALLOWED_CHAT_IDS || "")
+  .split(",")
+  .map((x) => x.trim())
+  .filter(Boolean);
 
-const CONCURRENCY = 2; // scan nhẹ để đỡ rate
-const REQUEST_TIMEOUT_MS = 20_000;
+if (ALLOWED.length === 0) {
+  console.error("❌ Missing ALLOWED_CHAT_IDS in .env (comma-separated chat IDs)");
+  process.exit(1);
+}
 
-const STATE_FILE = path.join(__dirname, "state.json");
-const DEFAULT_SOURCE = "";
-
-// One-shot signatures fetch (no paginate)
-const SIG_PAGE_LIMIT = 1000; // max getSignaturesForAddress
-
-// txt attachment limits
-const MAX_TXT_BYTES = 1_000_000; // 1MB
-
-// ================== STATE (PER-CHANNEL) ==================
-let state = { sources: {}, times: {}, presets: {}, oldestSigs: {} };
-
-function loadState() {
-  try {
-    if (fs.existsSync(STATE_FILE)) {
-      state = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-      if (!state || typeof state !== "object")
-        state = { sources: {}, times: {}, presets: {}, oldestSigs: {} };
-
-      if (!state.sources || typeof state.sources !== "object") state.sources = {};
-      if (!state.times || typeof state.times !== "object") state.times = {};
-      if (!state.presets || typeof state.presets !== "object") state.presets = {};
-      if (!state.oldestSigs || typeof state.oldestSigs !== "object") state.oldestSigs = {};
+const bot = new Telegraf(BOT_TOKEN);// ================== PRIVATE GROUP GUARD ==================
+bot.use((ctx, next) => {
+  const chatId = String(ctx.chat?.id || "");
+  if (!ALLOWED.includes(chatId)) {
+    // chỉ reply khi là group/supergroup, tránh spam private
+    if (ctx.chat?.type === "group" || ctx.chat?.type === "supergroup") {
+      ctx.reply("mày chưa được cấp quyền để dùng bot, tìm @mjiohaa trên telegram để mua bot.");
     }
-  } catch {
-    state = { sources: {}, times: {}, presets: {}, oldestSigs: {} };
+    return; // chặn toàn bộ logic phía dưới
   }
-}
-
-function saveState() {
-  try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), "utf8");
-  } catch (e) {
-    console.log("⚠️ Cannot save state.json:", e.message);
-  }
-}
-
-function scopeKey(guildId, channelId) {
-  return `${guildId}:${channelId}`;
-}
-
-function getSourceForChannel(guildId, channelId) {
-  return state.sources[scopeKey(guildId, channelId)] || DEFAULT_SOURCE;
-}
-function setSourceForChannel(guildId, channelId, source) {
-  state.sources[scopeKey(guildId, channelId)] = source;
-  saveState();
-}
-
-function getTimeForChannel(guildId, channelId) {
-  const v = state.times[scopeKey(guildId, channelId)];
-  return typeof v === "number" && Number.isFinite(v) ? v : DEFAULT_TIME_HOURS;
-}
-function setTimeForChannel(guildId, channelId, hours) {
-  state.times[scopeKey(guildId, channelId)] = hours;
-  saveState();
-}
-
-function looksLikeSolPubkey(s) {
-  if (!s) return false;
-  const t = s.trim();
-  if (t.length < 32 || t.length > 50) return false;
-  return /^[1-9A-HJ-NP-Za-km-z]+$/.test(t);
-}
-
-// ================== OLDEST SIG CACHE ==================
-// state.oldestSigs[wallet] = { sig, blockTime } OR { marker: "TOO_MANY_TX"|"TOO_OLD"|"NO_HISTORY", blockTime?, sig? }
-function getCachedOldest(wallet) {
-  const v = state.oldestSigs?.[wallet];
-  if (!v || typeof v !== "object") return null;
-  if (v.marker && typeof v.marker === "string") return v;
-  if (v.sig && typeof v.sig === "string") return v;
-  return null;
-}
-function setCachedOldest(wallet, obj) {
-  if (!state.oldestSigs || typeof state.oldestSigs !== "object") state.oldestSigs = {};
-  state.oldestSigs[wallet] = obj;
-  saveState();
-}
-function clearOldestCacheAll() {
-  state.oldestSigs = {};
-  saveState();
-}
-function clearOldestCacheWallets(wallets) {
-  if (!state.oldestSigs || typeof state.oldestSigs !== "object") state.oldestSigs = {};
-  let removed = 0;
-  for (const w of wallets) {
-    if (state.oldestSigs[w]) {
-      delete state.oldestSigs[w];
-      removed++;
-    }
-  }
-  saveState();
-  return removed;
-}
-
-// ================== PRESET (DEFAULT + USER) ==================
-const DEFAULT_SOURCE_PRESETS = {
-  kucoin: "BmFdpraQhkiDQE6SnfG5omcA1VwzqfXrwtNYBwWTymy6",
-  binance: "5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9",
-};
-
-function normalizePresetName(s) {
-  return String(s || "").trim().replace(/^"+|"+$/g, "").toLowerCase();
-}
-function isValidPresetName(name) {
-  return /^[a-z0-9_.-]{2,32}$/.test(name);
-}
-function getAllPresets() {
-  return { ...DEFAULT_SOURCE_PRESETS, ...(state.presets || {}) };
-}
-function getPreset(name) {
-  const all = getAllPresets();
-  return all[name] || null;
-}
-function setPreset(name, wallet) {
-  if (!state.presets || typeof state.presets !== "object") state.presets = {};
-  state.presets[name] = wallet;
-  saveState();
-}
-function delPreset(name) {
-  if (!state.presets || typeof state.presets !== "object") state.presets = {};
-  if (state.presets[name]) {
-    delete state.presets[name];
-    saveState();
-    return true;
-  }
-  return false;
-}
-
-// ================== DISCORD CLIENT ==================
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-  ],
-  partials: [Partials.Channel],
+  return next();
 });
 
-// ================== PRIVATE BOT: AUTO LEAVE OTHER GUILDS ==================
-client.on(Events.GuildCreate, async (guild) => {
-  try {
-    if (!isAllowedGuild(guild.id)) {
-      console.log(`⛔ Joined unauthorized guild ${guild.id} (${guild.name}) -> leaving`);
-      await guild.leave();
-    }
-  } catch (e) {
-    console.log("⚠️ guild.leave failed:", e.message);
-  }
-});
 
-// ================== UI HELPERS ==================
-function scanNowStr() {
-  return new Date().toLocaleString("vi-VN", { timeZone: "Asia/Bangkok" });
-}
-function formatTime(blockTime) {
-  if (!blockTime) return "N/A";
-  return new Date(blockTime * 1000).toLocaleString("vi-VN", { timeZone: "Asia/Bangkok" });
-}
-function solscanTransfersUrl(wallet) {
-  return `https://solscan.io/account/${wallet}?page_size=100#transfers`;
-}
-function solscanTxUrl(sig) {
-  return `https://solscan.io/tx/${sig}`;
-}
-function shortPk(pk) {
-  if (!pk || pk.length < 12) return pk || "";
-  return `${pk.slice(0, 4)}…${pk.slice(-4)}`;
-}
-function nowSec() {
-  return Math.floor(Date.now() / 1000);
-}
-function isOlderThanWindow(blockTime, timeHours) {
-  if (!Number.isFinite(blockTime)) return false;
 
-  // nếu blockTime lớn hơn hiện tại > 1 ngày => chắc chắn là SLOT → bỏ check
-  if (blockTime > nowSec() + 86400) return false;
+// ================== RAM STATE ==================
+// chatId => { seq, totalSaved, pendingSave }
+const RAM = new Map();
 
-  const maxAge = Number(timeHours) * 3600;
-  return nowSec() - blockTime > maxAge;
+function isAllowed(ctx) {
+  return ALLOWED.includes(String(ctx.chat?.id || ""));
 }
 
-// ================== RATE LIMIT ERROR ==================
-class RateLimitError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = "RateLimitError";
-    this.isRateLimit = true;
-  }
-}
-function isRateLimitMessage(msg) {
-  const m = String(msg || "").toLowerCase();
-  return m.includes("rate limit") || m.includes("too many requests") || m.includes("429");
+function bucket(chatId) {
+  if (!RAM.has(chatId)) RAM.set(chatId, { seq: 0, totalSaved: 0, pendingSave: null });
+  return RAM.get(chatId);
 }
 
-// ================== RPC HELPERS ==================
-let RPC_ID = 1;
+// Solana pubkey basic check
+function extractWallets(text) {
+  const re = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+  return String(text || "")
+    .split(/\s+/)
+    .map((x) => x.trim())
+    .filter((x) => re.test(x));
+}
 
-async function rpc(method, params) {
-  const res = await axios.post(
-    RPC_URL,
-    { jsonrpc: "2.0", id: RPC_ID++, method, params },
-    {
-      timeout: REQUEST_TIMEOUT_MS,
-      headers: { "Content-Type": "application/json" },
-      validateStatus: () => true,
-    }
+// ================== COMMANDS ==================
+bot.start((ctx) => {
+  if (!isAllowed(ctx)) return;
+  ctx.reply(
+    "🔒 Wallet Namer BOT (2 Groups)\n\n" +
+      "• /save <name> → reply tin nhắn bot trong 15s để paste ví\n" +
+      "• /reset → reset số đếm\n" +
+      "• /stats → xem tổng\n\n" +
+      `✅ Allowed groups: ${ALLOWED.length}`
   );
+});
 
-  if (res.status === 429) throw new RateLimitError(`Rate limited (HTTP 429) on ${method}`);
+bot.command("reset", (ctx) => {
+  if (!isAllowed(ctx)) return;
+  const b = bucket(ctx.chat.id);
+  b.seq = 0;
+  b.pendingSave = null;
+  ctx.reply("🔁 Reset xong, lần sau bắt đầu từ 1");
+});
 
-  if (res.data?.error?.message && isRateLimitMessage(res.data.error.message)) {
-    throw new RateLimitError(`Rate limited on ${method}: ${res.data.error.message}`);
-  }
+bot.command("stats", (ctx) => {
+  if (!isAllowed(ctx)) return;
+  const b = bucket(ctx.chat.id);
+  ctx.reply(`📊 seq=${b.seq} | total=${b.totalSaved}`);
+});
 
-  if (!res.data) throw new Error(`RPC empty response for ${method}`);
-  if (res.data.error) throw new Error(res.data.error.message || "RPC error");
-  return res.data.result;
-}
+bot.command("save", async (ctx) => {
+  if (!isAllowed(ctx)) return;
 
-async function getSignatures(address, limit = 50, before = null) {
-  const cfg = { limit };
-  if (before) cfg.before = before;
-  return rpc("getSignaturesForAddress", [address, cfg]);
-}
+  const name = String(ctx.message?.text || "")
+    .replace(/^\/save(@\w+)?\s*/i, "")
+    .trim();
 
-async function getTx(signature) {
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      return await rpc("getTransaction", [
-        signature,
-        { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 },
-      ]);
-    } catch (e) {
-      if (e?.isRateLimit) throw e;
-      if (attempt === 2) throw e;
-      await new Promise((r) => setTimeout(r, 350));
-    }
-  }
-  return null;
-}
+  if (!name) return ctx.reply("Dùng: /save <name>");
 
-async function getSolBalance(wallet) {
-  const res = await rpc("getBalance", [wallet, { commitment: "confirmed" }]);
-  return Number(res?.value || 0) / 1e9;
-}
+  const b = bucket(ctx.chat.id);
+  const msg = await ctx.reply(`⏳ Reply tin nhắn này trong 15s\nName: ${name}`);
+  b.pendingSave = { name, until: Date.now() + 15000, replyMsgId: msg.message_id };
+});
 
-function lamportsToSol(l) {
-  return l / 1_000_000_000;
-}
+// ================== ONLY ACCEPT REPLY TO BOT'S PROMPT ==================
+bot.on("text", async (ctx) => {
+  if (!isAllowed(ctx)) return;
 
-function extractSystemTransfers(tx) {
+  const b = bucket(ctx.chat.id);
+  if (!b.pendingSave || Date.now() > b.pendingSave.until) return;
+
+  const replyTo = ctx.message?.reply_to_message?.message_id;
+  if (replyTo !== b.pendingSave.replyMsgId) return;
+
+  const wallets = extractWallets(ctx.message.text);
+  if (!wallets.length) return;
+
+  const name = b.pendingSave.name;
+
   const out = [];
-  if (!tx) return out;
-
-  for (const ix of tx?.transaction?.message?.instructions || []) {
-    if (ix?.program === "system" && ix?.parsed?.type === "transfer") {
-      const info = ix.parsed.info;
-      out.push({ from: info.source, to: info.destination, lamports: Number(info.lamports || 0) });
-    }
-  }
-  for (const group of tx?.meta?.innerInstructions || []) {
-    for (const ix of group?.instructions || []) {
-      if (ix?.program === "system" && ix?.parsed?.type === "transfer") {
-        const info = ix.parsed.info;
-        out.push({ from: info.source, to: info.destination, lamports: Number(info.lamports || 0) });
-      }
-    }
-  }
-  return out;
-}
-
-// ================== OPTIMIZED: FIND OLDEST (ONE CALL) + CACHE + TIME WINDOW SKIP ==================
-async function findOldestCached(address, timeHours) {
-  const cached = getCachedOldest(address);
-  if (cached) {
-    if (cached.sig && cached.blockTime && isOlderThanWindow(cached.blockTime, timeHours)) {
-      const obj = { marker: "TOO_OLD", blockTime: cached.blockTime, sig: cached.sig };
-      setCachedOldest(address, obj);
-      return obj;
-    }
-    return cached;
+  for (const w of wallets) {
+    b.seq++;
+    b.totalSaved++;
+    out.push(`${w} ${name} ${b.seq}`);
   }
 
-  const first = await getSignatures(address, SIG_PAGE_LIMIT, null);
-  if (!Array.isArray(first) || first.length === 0) {
-    const obj = { marker: "NO_HISTORY" };
-    setCachedOldest(address, obj);
-    return obj;
+  // clear pending
+  b.pendingSave = null;
+
+  // Telegram text limit ~4096 chars
+  const text = out.join("\n");
+  const MAX_TG = 3900; // chừa headroom
+
+  if (text.length <= MAX_TG) {
+    return ctx.reply(text);
   }
 
-  if (first.length === SIG_PAGE_LIMIT) {
-    const obj = { marker: "TOO_MANY_TX" };
-    setCachedOldest(address, obj);
-    return obj;
-  }
-
-  const last = first[first.length - 1];
-  const sig = last?.signature || null;
-  const bt = Number.isFinite(last?.blockTime) ? last.blockTime : null;
-
-  if (bt && isOlderThanWindow(bt, timeHours)) {
-    const obj = { marker: "TOO_OLD", blockTime: bt, sig };
-    setCachedOldest(address, obj);
-    return obj;
-  }
-
-  const obj = { sig, blockTime: bt };
-  setCachedOldest(address, obj);
-  return obj;
-}
-
-// ================== INPUT PARSE ==================
-function parseWallets(raw) {
-  return raw
-    .split(/\r?\n|\/\/\/|,|;/)
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map((s) => s.replace(/^"+|"+$/g, ""))
-    .filter(Boolean);
-}
-
-// ================== ATTACHMENT TXT SUPPORT ==================
-function pickTxtAttachment(msg) {
-  const atts = [...msg.attachments.values()];
-  if (atts.length === 0) return null;
-
-  const byName = (a) => (a.name || "").toLowerCase();
-  const isTxt = (a) => byName(a).endsWith(".txt") || byName(a) === "message.txt";
-  const txt = atts.find(isTxt);
-  if (txt) return txt;
-
-  const plain = atts.find((a) => (a.contentType || "").includes("text/plain"));
-  return plain || null;
-}
-
-async function downloadAttachmentText(att) {
-  const size = Number(att.size || 0);
-  if (size > MAX_TXT_BYTES) {
-    throw new Error(
-      `File quá lớn (${Math.round(size / 1024)}KB). Max ~${Math.round(MAX_TXT_BYTES / 1024)}KB.`
-    );
-  }
-  const url = att.url;
-  const res = await axios.get(url, { responseType: "text", timeout: REQUEST_TIMEOUT_MS });
-  if (typeof res.data !== "string") throw new Error("Không đọc được nội dung file text.");
-  return res.data;
-}
-
-// ================== CONCURRENCY ==================
-async function mapLimit(arr, limit, fn, shouldStop) {
-  const ret = new Array(arr.length);
-  let i = 0;
-  const workers = Array.from({ length: Math.min(limit, arr.length) }, () =>
-    (async () => {
-      while (true) {
-        if (shouldStop && shouldStop()) break;
-        const idx = i++;
-        if (idx >= arr.length) break;
-        if (shouldStop && shouldStop()) break;
-        ret[idx] = await fn(arr[idx], idx);
-      }
-    })()
-  );
-  await Promise.allSettled(workers);
-  return ret;
-}
-
-// ================== SCAN LOGIC ==================
-async function scanWalletWithSource(wallet, sourceWallet, timeHours) {
-  const info = await findOldestCached(wallet, timeHours);
-
-  if (info.marker === "NO_HISTORY") {
-    console.log(`[WHITE] ${wallet} -> NO HISTORY`);
-    return null;
-  }
-  if (info.marker === "TOO_MANY_TX") {
-    console.log(`[WHITE] ${wallet} -> SKIP (too many tx, first page=1000)`);
-    return null;
-  }
-  if (info.marker === "TOO_OLD") {
-    console.log(
-      `[WHITE] ${wallet} -> SKIP (oldest too old) bt=${info.blockTime || "N/A"} window=${timeHours}h sig=${info.sig || "-"}`
-    );
-    return null;
-  }
-
-  const oldestSig = info.sig;
-  if (!oldestSig) {
-    console.log(`[WHITE] ${wallet} -> NO OLDEST SIG`);
-    return null;
-  }
-
-  const tx = await getTx(oldestSig);
-  const blockTime = tx?.blockTime || info.blockTime || null;
-
-  if (blockTime && isOlderThanWindow(blockTime, timeHours)) {
-    console.log(`[WHITE] ${wallet} -> SKIP (oldest too old after tx) bt=${blockTime} window=${timeHours}h`);
-    setCachedOldest(wallet, { marker: "TOO_OLD", blockTime, sig: oldestSig });
-    return null;
-  }
-
-  const transfers = extractSystemTransfers(tx);
-
-  for (const tr of transfers) {
-    if (tr.from !== sourceWallet) continue;
-    if (tr.to !== wallet) continue;
-
-    const sol = lamportsToSol(tr.lamports);
-    const balance = await getSolBalance(wallet);
-
-    console.log(
-      `[WHITE] ✅ MATCH wallet=${wallet} oldestSig=${oldestSig} time=${blockTime} amount=${sol.toFixed(4)} SOL`
-    );
-
-    setCachedOldest(wallet, { sig: oldestSig, blockTime });
-
-    return {
-      wallet,
-      balance,
-      source: sourceWallet,
-      fundedSol: sol,
-      sig: oldestSig,
-      fundingTime: formatTime(blockTime),
-      scannedAt: scanNowStr(),
-      txCondition: "TX CŨ NHẤT là funding từ Source",
-      timeRule: `${timeHours} giờ`,
-    };
-  }
-
-  console.log(`[WHITE] ❌ NOT wallet=${wallet} oldestSig=${oldestSig} time=${blockTime}`);
-  setCachedOldest(wallet, { sig: oldestSig, blockTime });
-  return null;
-}
-
-// ================== MATCHES TXT FILE ==================
-function buildMatchesTxt(hits) {
-  // Format đúng như bạn muốn: wallet balance sol
-  return hits.map((h) => `${h.wallet} ${Number(h.balance || 0).toFixed(4)} sol`).join("\n") + "\n";
-}
-function makeMatchesAttachment(hits) {
-  const content = buildMatchesTxt(hits);
-  const buf = Buffer.from(content, "utf8");
-  const filename = `matched_${Date.now()}.txt`;
-  return new AttachmentBuilder(buf, { name: filename });
-}
-
-// ================== PRETTY OUTPUT ==================
-function makeSummaryEmbed({ source, timeHours, scannedCount, hitCount, channelId, stoppedReason }) {
-  const color = stoppedReason ? 0xe67e22 : hitCount > 0 ? 0x2ecc71 : 0x95a5a6;
-  const title = stoppedReason
-    ? "⛔ Scan Stopped (Rate Limit)"
-    : "🔎 Scan Result (Oldest TX + Time Window + Cache)";
-
-  const extra = stoppedReason
-    ? `\n\n⚠️ **Stopped:** ${stoppedReason}\n👉 Hãy giảm list / đợi vài phút / đổi RPC xịn hơn.`
-    : "";
-
-  return new EmbedBuilder()
-    .setTitle(title)
-    .setColor(color)
-    .setDescription(
-      `**Channel:** <#${channelId}>\n` +
-        `**Source:** ${source ? `[${shortPk(source)}](${solscanTransfersUrl(source)})` : "*chưa set*"}\n` +
-        `**Time window:** **${timeHours} giờ**\n` +
-        `**Rule:** TX cũ nhất phải là funding từ Source\n` +
-        `**Scanned:** **${scannedCount}** • **Matched:** **${hitCount}**\n` +
-        `**Scan time:** **${scanNowStr()}**` +
-        extra
-    )
-    .setTimestamp(new Date());
-}
-
-function makeWalletEmbed(hit) {
-  const transfersLink = solscanTransfersUrl(hit.wallet);
-  const txLink = solscanTxUrl(hit.sig);
-
-  return new EmbedBuilder()
-    .setTitle(`✅ MATCH: ${shortPk(hit.wallet)}`)
-    .setURL(transfersLink)
-    .setColor(0x2ecc71)
-    .setDescription(
-      `**Wallet:** [${hit.wallet}](${transfersLink})\n` +
-        `**Balance:** **${Number(hit.balance || 0).toFixed(3)} SOL**\n\n` +
-        `**Rule:** **${hit.txCondition}**\n` +
-        `**Oldest TX time:** **${hit.fundingTime}**\n` +
-        `**Time window:** **${hit.timeRule}**\n` +
-        `**Scanned at:** **${hit.scannedAt}**\n\n` +
-        `**Source:** [${shortPk(hit.source)}](${solscanTransfersUrl(hit.source)})\n` +
-        `**Amount from source:** **${hit.fundedSol.toFixed(3)} SOL**\n` +
-        `**TX:** [Open on Solscan](${txLink})`
-    )
-    .setFooter({ text: "Solana White Funding Scanner (Oldest + Time Window + Cache)" })
-    .setTimestamp(new Date());
-}
-
-function makeWalletButtons(hit) {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setLabel("Open Transfers").setStyle(ButtonStyle.Link).setURL(solscanTransfersUrl(hit.wallet)),
-    new ButtonBuilder().setLabel("Open TX").setStyle(ButtonStyle.Link).setURL(solscanTxUrl(hit.sig))
-  );
-}
-
-async function sendStoppedMessage(target, reason) {
-  const msg = `⚠️ **Rate limit hit** → bot đã **dừng scan**.\n**Reason:** ${reason}`;
-  try {
-    if ("followUp" in target) return await target.followUp({ content: msg });
-    if ("channel" in target && target.channel) return await target.channel.send({ content: msg });
-    if ("reply" in target) return await target.reply({ content: msg });
-  } catch {}
-}
-
-async function runScanAndRespond(target, wallets, source, timeHours, channelId) {
-  let stoppedReason = "";
-  let scannedSoFar = 0;
-
-  const shouldStop = () => Boolean(stoppedReason);
-
-  const results = await mapLimit(
-    wallets,
-    CONCURRENCY,
-    async (w) => {
-      if (shouldStop()) return null;
-      scannedSoFar++;
-
-      try {
-        return await scanWalletWithSource(w, source, timeHours);
-      } catch (e) {
-        if (e?.isRateLimit || e?.name === "RateLimitError") {
-          stoppedReason = e.message || "Rate limit";
-          console.log(`[WHITE] ⛔ STOP: ${stoppedReason}`);
-          return null;
-        }
-        console.log(`[WHITE] ⚠️ ERROR wallet=${w}: ${e.message}`);
-        return null;
-      }
-    },
-    shouldStop
-  );
-
-  const hits = (results || []).filter(Boolean);
-  hits.sort((a, b) => b.fundedSol - a.fundedSol || b.balance - a.balance);
-
-  const summary = makeSummaryEmbed({
-    source,
-    timeHours,
-    scannedCount: stoppedReason ? scannedSoFar : wallets.length,
-    hitCount: hits.length,
-    channelId,
-    stoppedReason: stoppedReason || "",
-  });
-
-  // ✅ Attach txt file if has matches
-  const files = hits.length > 0 ? [makeMatchesAttachment(hits)] : [];
-
-  if ("editReply" in target) {
-    await target.editReply({
-      content: hits.length > 0 ? "@everyone" : "",
-      embeds: [summary],
-      files,
-    });
-  } else {
-    await target.reply({
-      content: hits.length > 0 ? "@everyone" : "",
-      embeds: [summary],
-      files,
-    });
-  }
-
-  if (stoppedReason) {
-    await sendStoppedMessage(target, stoppedReason);
-    return;
-  }
-
-  if (hits.length === 0) return;
-
-  const top = hits.slice(0, 5);
-  for (const h of top) {
-    const embed = makeWalletEmbed(h);
-    const row = makeWalletButtons(h);
-
-    if ("followUp" in target) await target.followUp({ embeds: [embed], components: [row] });
-    else await target.channel.send({ embeds: [embed], components: [row] });
-  }
-
-  if (hits.length > 5) {
-    const moreText = `ℹ️ Có thêm **${hits.length - 5}** match khác (đang chỉ hiển thị 5 match đầu).`;
-    if ("followUp" in target) await target.followUp({ content: moreText });
-    else await target.channel.send({ content: moreText });
-  }
-}
-
-// ================== /scanlist WAITING ==================
-const waiting = new Map(); // key = guild:user:channel
-function waitKey(guildId, userId, channelId) {
-  return `${guildId}:${userId}:${channelId}`;
-}
-
-// ================== INTERACTIONS ==================
-client.on("interactionCreate", async (interaction) => {
-  try {
-    // PRIVATE LOCK: chặn DM + chặn sai server
-    if (!interaction.guildId) return;
-
-    if (!isAllowedGuild(interaction.guildId)) {
-      // autocomplete: im lặng để khỏi spam
-      if (interaction.isAutocomplete()) {
-        try {
-          return interaction.respond([]);
-        } catch {
-          return;
-        }
-      }
-
-      // command: nói đúng câu bạn yêu cầu
-      if (interaction.isChatInputCommand()) {
-        try {
-          if (!interaction.deferred && !interaction.replied) {
-            await interaction.reply({ content: UNAUTHORIZED_MSG, ephemeral: true });
-          }
-        } catch {}
-      }
-      return;
-    }
-
-    // AUTOCOMPLETE (/source wallet)
-    if (interaction.isAutocomplete()) {
-      if (interaction.commandName !== "source") return;
-
-      const focused = interaction.options.getFocused(true);
-      if (!focused || focused.name !== "wallet") return;
-
-      const q = String(focused.value || "").toLowerCase();
-      const presets = getAllPresets();
-      const keys = Object.keys(presets).sort();
-
-      const results = keys
-        .filter((k) => k.startsWith(q))
-        .slice(0, 25)
-        .map((k) => ({
-          name: `${k} (${presets[k].slice(0, 4)}…${presets[k].slice(-4)})`,
-          value: k,
-        }));
-
-      return interaction.respond(results);
-    }
-
-    if (!interaction.isChatInputCommand()) return;
-
-    const guildId = interaction.guildId;
-    const channelId = interaction.channelId;
-    if (!guildId || !channelId) return;
-
-    // /show
-    if (interaction.commandName === "show") {
-      await interaction.deferReply();
-
-      const source = getSourceForChannel(guildId, channelId);
-      const timeHours = getTimeForChannel(guildId, channelId);
-
-      const e = new EmbedBuilder()
-        .setTitle("⚙️ Current Config (This Channel)")
-        .setColor(0x3498db)
-        .setDescription(
-          `**Channel:** <#${channelId}>\n` +
-            `**Source:** ${source ? `[${source}](${solscanTransfersUrl(source)})` : "*chưa set*"}\n` +
-            `**Time window:** **${timeHours} giờ**\n` +
-            `**Rule:** TX cũ nhất phải là funding từ Source\n\n` +
-            `Dùng:\n` +
-            `- \`/source wallet:<pubkey>\` hoặc \`/source wallet:<presetName>\`\n` +
-            `- \`/preset add/del/list\`\n` +
-            `- \`/time hours:5\`\n` +
-            `- \`/scan wallet:<wallet>\`\n` +
-            `- \`/scanlist\`\n` +
-            `- \`/cacheclear\`\n\n` +
-            `📎 Scan xong có match sẽ gửi kèm file .txt: \`wallet balance sol\``
-        )
-        .setTimestamp(new Date());
-
-      return interaction.editReply({ embeds: [e] });
-    }
-
-    // /preset
-    if (interaction.commandName === "preset") {
-      await interaction.deferReply();
-      const sub = interaction.options.getSubcommand();
-
-      if (sub === "add") {
-        const name = normalizePresetName(interaction.options.getString("name"));
-        const wallet = String(interaction.options.getString("wallet") || "")
-          .trim()
-          .replace(/^"+|"+$/g, "");
-
-        if (!name || !isValidPresetName(name)) {
-          return interaction.editReply("❌ Tên preset không hợp lệ (2-32 ký tự: a-z 0-9 _ - .).");
-        }
-        if (!looksLikeSolPubkey(wallet)) {
-          return interaction.editReply("❌ Wallet không hợp lệ (pubkey Solana).");
-        }
-
-        setPreset(name, wallet);
-
-        const e = new EmbedBuilder()
-          .setTitle("✅ Preset Added")
-          .setColor(0x2ecc71)
-          .setDescription(`**Name:** **${name}**\n**Wallet:** \`${wallet}\`\n\nDùng: \`/source wallet:${name}\``)
-          .setTimestamp(new Date());
-
-        return interaction.editReply({ embeds: [e] });
-      }
-
-      if (sub === "del") {
-        const name = normalizePresetName(interaction.options.getString("name"));
-        const ok = delPreset(name);
-        if (!ok) {
-          return interaction.editReply(
-            `⚠️ Không tìm thấy preset **${name}** trong user presets (default preset không xoá được).`
-          );
-        }
-        return interaction.editReply(`✅ Đã xoá preset **${name}**.`);
-      }
-
-      if (sub === "list") {
-        const all = getAllPresets();
-        const keys = Object.keys(all).sort();
-        if (keys.length === 0) return interaction.editReply("⚠️ Chưa có preset nào.");
-
-        const lines = keys.slice(0, 80).map((k) => `- **${k}** → \`${all[k]}\``);
-        const more = keys.length > 80 ? `\n… và còn **${keys.length - 80}** preset nữa.` : "";
-
-        const e = new EmbedBuilder()
-          .setTitle("📌 Preset List")
-          .setColor(0x3498db)
-          .setDescription(lines.join("\n") + more)
-          .setTimestamp(new Date());
-
-        return interaction.editReply({ embeds: [e] });
-      }
-
-      return interaction.editReply("❌ Subcommand không hợp lệ.");
-    }
-
-    // /source
-    if (interaction.commandName === "source") {
-      await interaction.deferReply();
-
-      const raw = interaction.options.getString("wallet");
-      const input = String(raw || "").trim().replace(/^"+|"+$/g, "");
-
-      const name = normalizePresetName(input);
-      const presetWallet = getPreset(name);
-
-      let source = presetWallet || input;
-
-      if (!presetWallet && !looksLikeSolPubkey(source)) {
-        return interaction.editReply(
-          "❌ Source không hợp lệ.\n" +
-            `- Pubkey: \`/source wallet:5tzF...\`\n` +
-            `- Preset: \`/source wallet:kucoin\`\n` +
-            `- Quản lý: \`/preset add/del/list\``
-        );
-      }
-
-      setSourceForChannel(guildId, channelId, source);
-      const hint = presetWallet ? ` (preset: **${name}**)` : "";
-
-      const e = new EmbedBuilder()
-        .setTitle("✅ Source Updated (This Channel)")
-        .setColor(0x3498db)
-        .setDescription(
-          `**Channel:** <#${channelId}>\n` +
-            `Source:${hint}\n` +
-            `**${source}**\n\nLink: ${solscanTransfersUrl(source)}`
-        )
-        .setTimestamp(new Date());
-
-      return interaction.editReply({ embeds: [e] });
-    }
-
-    // /time
-    if (interaction.commandName === "time") {
-      await interaction.deferReply();
-
-      const h = Number(interaction.options.getNumber("hours"));
-      if (!Number.isFinite(h) || h < 1 || h > 168) {
-        return interaction.editReply("❌ Hours không hợp lệ (1 → 168).");
-      }
-
-      setTimeForChannel(guildId, channelId, h);
-
-      const e = new EmbedBuilder()
-        .setTitle("✅ Time Window Updated (This Channel)")
-        .setColor(0xf39c12)
-        .setDescription(`**Channel:** <#${channelId}>\nTime window: **${h} giờ**`)
-        .setTimestamp(new Date());
-
-      return interaction.editReply({ embeds: [e] });
-    }
-
-    // /cacheclear
-    if (interaction.commandName === "cacheclear") {
-      await interaction.deferReply({ ephemeral: true });
-
-      const mode = interaction.options.getString("mode") || "channel";
-
-      if (mode === "all") {
-        clearOldestCacheAll();
-        return interaction.editReply("✅ Đã xoá **toàn bộ** cache `oldestSigs`.");
-      }
-
-      const raw = interaction.options.getString("wallets") || "";
-      const wallets = raw ? [...new Set(parseWallets(raw))] : [];
-
-      if (wallets.length === 0) {
-        return interaction.editReply(
-          "⚠️ Mode `channel` cần nhập option `wallets` (paste nhiều dòng) để xoá cache cho đúng ví.\n" +
-            "Hoặc chọn `mode:all` để xoá hết."
-        );
-      }
-
-      const removed = clearOldestCacheWallets(wallets);
-      return interaction.editReply(`✅ Đã xoá cache cho **${removed}/${wallets.length}** ví.`);
-    }
-
-    // /scan
-    if (interaction.commandName === "scan") {
-      await interaction.deferReply();
-
-      const source = getSourceForChannel(guildId, channelId);
-      if (!source) return interaction.editReply(`⚠️ Chưa set source. Dùng: \`/source wallet:YourSourceWallet\``);
-
-      const timeHours = getTimeForChannel(guildId, channelId);
-
-      const w = interaction.options.getString("wallet").trim().replace(/^"+|"+$/g, "");
-      if (!looksLikeSolPubkey(w)) return interaction.editReply("❌ Wallet không hợp lệ.");
-
-      return runScanAndRespond(interaction, [w], source, timeHours, channelId);
-    }
-
-    // /scanlist
-    if (interaction.commandName === "scanlist") {
-      await interaction.deferReply();
-
-      const source = getSourceForChannel(guildId, channelId);
-      if (!source) return interaction.editReply(`⚠️ Chưa set source. Dùng: \`/source wallet:YourSourceWallet\``);
-
-      const timeHours = getTimeForChannel(guildId, channelId);
-
-      const key = waitKey(guildId, interaction.user.id, channelId);
-      waiting.set(key, { expiresAt: Date.now() + 60_000, source, timeHours, channelId });
-
-      const e = new EmbedBuilder()
-        .setTitle("📝 Paste list hoặc upload .txt")
-        .setColor(0xf1c40f)
-        .setDescription(
-          `**Channel:** <#${channelId}>\n` +
-            `Trong **60 giây**, bạn có thể paste list ví hoặc upload file .txt\n\n` +
-            `**Source:** ${shortPk(source)}\n` +
-            `**Time window:** ${timeHours} giờ\n` +
-            `**Rule:** TX cũ nhất phải là funding từ Source\n\n` +
-            `Ví dụ:\n\`wallet1\nwallet2\nwallet3\``
-        )
-        .setTimestamp(new Date());
-
-      return interaction.editReply({ embeds: [e] });
-    }
-  } catch (e) {
-    try {
-      if (interaction.deferred || interaction.replied) await interaction.editReply(`❌ Lỗi: ${e.message}`);
-    } catch {}
-  }
+  // too long -> send as .txt
+  const filename = `saved_${name}_${Date.now()}.txt`;
+  const header =
+    `✅ Saved ${out.length} wallets\n` +
+    `Name: ${name}\n` +
+    `---\n`;
+
+  const fileBuf = Buffer.from(header + text + "\n", "utf8");
+
+  await ctx.reply(`📄 Output dài quá (${text.length} chars) → gửi file .txt nha 😄`);
+  return ctx.replyWithDocument({ source: fileBuf, filename });
 });
 
-// ================== MESSAGE HANDLER FOR /scanlist ==================
-client.on("messageCreate", async (msg) => {
-  try {
-    if (msg.author.bot) return;
-    if (!msg.guildId) return;
+// ================== BOOT ==================
+bot.launch();
+console.log("✅ Wallet Namer BOT started");
+console.log("🔒 Allowed chat IDs:", ALLOWED.join(", "));
 
-    // PRIVATE LOCK: sai server thì bỏ qua
-    if (!isAllowedGuild(msg.guildId)) return;
-
-    const key = waitKey(msg.guildId, msg.author.id, msg.channelId);
-    const w = waiting.get(key);
-    if (!w) return;
-
-    if (Date.now() > w.expiresAt) {
-      waiting.delete(key);
-      return;
-    }
-
-    waiting.delete(key);
-
-    let rawText = msg.content || "";
-    const att = pickTxtAttachment(msg);
-
-    if (att) {
-      try {
-        rawText = await downloadAttachmentText(att);
-      } catch (e) {
-        return msg.reply(`❌ Không đọc được file .txt: ${e.message}`);
-      }
-    }
-
-    const wallets = [...new Set(parseWallets(rawText))].slice(0, 250);
-    if (wallets.length === 0) return msg.reply("❌ Không thấy ví nào (paste sai format hoặc file rỗng).");
-
-    const srcHint = att ? `📎 Đã đọc từ file: **${att.name}**` : "📝 Đã đọc từ message";
-    await msg.reply(`${srcHint}\n⏳ Đang scan **${wallets.length}** ví... (log ra console luôn)`);
-
-    return runScanAndRespond(msg, wallets, w.source, w.timeHours, w.channelId);
-  } catch {}
-});
-
-// ================== START ==================
-(async () => {
-  if (!RPC_URL) {
-    console.error("❌ Missing RPC_URL in .env");
-    process.exit(1);
-  }
-  if (!process.env.DISCORD_BOT_TOKEN) {
-    console.error("❌ Missing DISCORD_BOT_TOKEN in .env");
-    process.exit(1);
-  }
-  if (!ALLOWED_GUILD_ID) {
-    console.error("❌ Missing ALLOWED_GUILD_ID in .env (private bot mode)");
-    process.exit(1);
-  }
-
-  loadState();
-
-  client.once(Events.ClientReady, async (c) => {
-    console.log(`✅ Bot logged in as ${c.user.tag}`);
-    console.log(`🔒 Private mode: ALLOWED_GUILD_ID=${ALLOWED_GUILD_ID}`);
-    console.log(`⏱ Default Time: ${DEFAULT_TIME_HOURS} hours`);
-    console.log(`🧩 Config scope: PER CHANNEL`);
-    console.log(`📎 scanlist: supports .txt attachment`);
-    console.log(`✨ autocomplete: /source wallet:<presetName>`);
-    console.log(`🧠 Logic: OLDEST TX funding from SOURCE + time window`);
-    console.log(`⛔ Stop scan on rate limit + send Discord message`);
-    console.log(`💾 Cache: state.oldestSigs enabled`);
-    console.log(`📄 Matched list: send .txt (wallet balance sol)`);
-
-    // dọn sạch: nếu bot đang ở server lạ thì leave luôn
-    for (const g of c.guilds.cache.values()) {
-      if (!isAllowedGuild(g.id)) {
-        try {
-          console.log(`⛔ Leaving unauthorized guild ${g.id} (${g.name})`);
-          await g.leave();
-        } catch {}
-      }
-    }
-  });
-
-  await client.login(process.env.DISCORD_BOT_TOKEN);
-})();
+// graceful stop
+process.once("SIGINT", () => bot.stop("SIGINT"));
+process.once("SIGTERM", () => bot.stop("SIGTERM"));
