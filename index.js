@@ -920,7 +920,8 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 // ================== MESSAGE HANDLER FOR /scanlist ==================
-client.on("messageCreate", async (msg) => {
+client.on("messageCreate", async (msg) => {console.log("[MSG]", msg.guildId, msg.channelId, "parent=", msg.channel?.parentId || "-", "thread=", !!msg.channel?.isThread?.());
+
   try {
     if (msg.author.bot) return;
     if (!msg.guildId) return;
